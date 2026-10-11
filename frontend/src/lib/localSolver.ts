@@ -31,6 +31,38 @@ export interface Analysis {
   explanation: string;
 }
 
+/* ---------------- user-friendly clarification -------------------------------
+   Instead of a dead-end error ("go away and add X"), the solver traces what
+   it understood and exactly what is still missing. ClarificationError extends
+   Error so old catch-blocks keep working, but the UI can render a helpful
+   understanding card with one-click fixes. */
+
+export type DetectedType = ModelType | 'production?' | 'transportation?' | 'game?' | 'unknown';
+
+export class ClarificationError extends Error {
+  detected: DetectedType;
+  understood: string[];
+  missing: string[];
+  fixExample: string;
+  appendFix: string;
+  constructor(opts: {
+    message: string;
+    detected: DetectedType;
+    understood?: string[];
+    missing?: string[];
+    fixExample?: string;
+    appendFix?: string;
+  }) {
+    super(opts.message);
+    this.name = 'ClarificationError';
+    this.detected = opts.detected;
+    this.understood = opts.understood ?? [];
+    this.missing = opts.missing ?? [];
+    this.fixExample = opts.fixExample ?? '';
+    this.appendFix = opts.appendFix ?? '';
+  }
+}
+
 const round2 = (v: number) => Math.round(v * 100) / 100;
 const round4 = (v: number) => Math.round(v * 10000) / 10000;
 /** Python-style {:.4g} formatting for the game explanation. */
@@ -137,7 +169,13 @@ function productNameFromSentence(sentence: string, fallback: string): string {
   }
   // "Chairs give 40", "Bread earns 25", "Phone yields 120"
   m = /([A-Za-z][A-Za-z0-9\- ]{0,28}?)\s+(?:gives?|earns?|yields?|makes?|brings?|fetches?|nets?)\s+(?:a\s+)?(?:profit\s+(?:of\s+)?)?\$?\d/i.exec(sentence);
-  if (m && !STOP_WORDS.has(m[1].trim().toLowerCase())) return cleanName(m[1]);
+  if (m && !STOP_WORDS.has(m[1].trim().toLowerCase())) {
+    let cand = cleanName(m[1]);
+    cand = cand.replace(/^(we|they|you|i)\s+/i, '').trim();
+    cand = cand.replace(/^(make|makes|produces?|manufactures?|sells?|offers?|builds?)\s+/i, '').trim();
+    cand = cand.replace(/\s+(that|which|who)$/i, '').trim();
+    if (cand && !STOP_WORDS.has(cand.toLowerCase())) return cand;
+  }
   // "profit for chairs is 40", "profit of tables: 30" (separator required so names like X1 stay intact)
   m = /(?:profit|margin|earning|contribution|gain)(?:\s*(?:per|for|of|on))?\s+(?:of\s+)?([A-Za-z][A-Za-z0-9\- ]{0,28}?)\s+(?:is|=|:|of)\s*\$?\d/i.exec(sentence);
   if (m && !STOP_WORDS.has(m[1].trim().toLowerCase())) {
@@ -496,7 +534,7 @@ function norm(s: string): string {
 
 function cleanNodeName(raw: string): string {
   let s = raw.trim().replace(/\s+/g, ' ');
-  s = s.replace(/^(the|each|every|our|from|to|at|in|of)\s+/i, '').trim();
+  s = s.replace(/^(the|each|every|our|and|both|from|to|at|in|of)\s+/i, '').trim();
   // strip trailing verbs/adjectives captured by lazy regexes ("Factory A can" -> "Factory A")
   s = s.replace(/\s+(can|has|have|with|holds?|stocks?|suppl\w*|supply|produces?|makes?|offers?|provides?|needs?|requires?|demands?|demand|orders?|wants?)$/i, '').trim();
   s = s.replace(/\s+(factory|warehouse|plant|supplier|depot|store|shop|city|region|destination|source)s?$/i, (m) => m);
@@ -504,50 +542,91 @@ function cleanNodeName(raw: string): string {
 }
 
 export function parseTransportation(text: string): TransportData | null {
+  // Production texts ("Demand for A at most 40", "We have 100 units Machine")
+  // must never be mistaken for shipping. If profit wording is present without
+  // any shipping nouns, this is not transportation.
+  if (
+    /profit|margin|earn|contribution|gain|revenue/i.test(text) &&
+    !/warehouse|factory|plant|supplier|depot|store|shop|ship|freight|transport|deliver|customer|retailer/i.test(text)
+  ) {
+    return null;
+  }
   const sources: { name: string; supply: number }[] = [];
   const destinations: { name: string; demand: number }[] = [];
   const seen = new Set<string>();
   const pushUnique = (arr: { name: string; supply: number }[] | { name: string; demand: number }[], name: string, qty: string, kind: 's' | 'd') => {
     const cleaned = cleanNodeName(name);
     if (!cleaned) return;
+    // never treat pronouns or bare verbs as places ("We have 100" is capacity, not a warehouse)
+    if (/^(we|they|you|he|she|it|there|here|this|that|they have|we have)$/i.test(cleaned)) return;
     const key = kind + ':' + norm(cleaned);
     if (seen.has(key)) return;
     seen.add(key);
     (arr as { name: string; supply: number }[]).push({ name: cleaned, supply: parseFloat(qty) } as never);
   };
   let m: RegExpExecArray | null;
-  // 1) explicit supply phrasing
+  // 1) explicit supply phrasing — broad, any wording:
+  //    "Warehouse A has supply 100", "A supplies 150", "100 units at A",
+  //    "A: 100 units", "supply at A is 100", "A can ship 100", "A has 100"
   const supPatterns = [
     /([A-Za-z][\w\- ]*?)\s+(?:has\s+supply|suppl\w*(?:ies)?|supply)\s+(?:of\s+)?(\d+(?:\.\d+)?)/gi,
     /(?:supply|stock|inventory|capacity|available)\s+(?:at|from|of)\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*(\d+(?:\.\d+)?)/gi,
     /(factory|warehouse|plant|supplier|depot|origin)\s+([A-Za-z0-9\- ]*?)\s*(?:has|holds?|stocks?|with|can supply|produces?|makes?|offers?)?\s*(?:supply|stock|inventory|capacity|available|units?)?\s*(?:of\s*|is\s*|:|=)?\s*(\d+(?:\.\d+)?)\s*(?:units?)?/gi,
+    /(\d+(?:\.\d+)?)\s*units?\s+(?:at|from|in)\s+([A-Za-z][\w\- ]*?)(?=\s*(?:and|,|;|\.|$))/gi,
+    /([A-Za-z][\w\- ]*?)\s*(?:can\s+supply|can\s+ship|can\s+send|ships?|sends?|provides?|offers?)\s+(?:up\s+to\s+|about\s+)?(\d+(?:\.\d+)?)\s*(?:units?)?/gi,
+    /([A-Za-z][\w\- ]*?)\s*(?:has|holds?|stocks?|with|contains?)\s+(?:up\s+to\s+|about\s+|around\s+)?(\d+(?:\.\d+)?)\s*units?\s*(?:supply|stock|inventory|available|to\s+ship|to\s+send)?/gi,
+    /([A-Za-z][\w\- ]*?)\s*[:=]\s*(\d+(?:\.\d+)?)\s*units?\s*(?:supply|stock|available)?(?=\s*(?:and|,|;|\.|$))/gi,
   ];
   for (const re of supPatterns) {
     re.lastIndex = 0;
     while ((m = re.exec(text)) !== null) {
       if (m.length === 4) {
+        // patterns with (keyword, place, qty) or (qty, place)
+        if (/^\d/.test(m[1] ?? '')) {
+          // "100 units at A" -> groups are (qty, place)
+          if (/^\s*\d/.test(m[0]) && /at|from|in/i.test(m[0])) {
+            pushUnique(sources, m[2], m[1], 's');
+            continue;
+          }
+        }
         const place = `${m[1]} ${m[2]}`.trim();
         pushUnique(sources, place, m[3], 's');
       } else {
+        // guard: "X: 100" must look supply-ish nearby to avoid eating costs/profits
+        if (/^[^:]*[:=]\s*\d/.test(m[0]) && !/suppl|supply|stock|inventory|has|holds?|ships?|sends?|provides?|warehouse|factory|plant|depot|units?\s*(?:at|from)?/i.test(m[0] + ' ' + text.slice(Math.max(0, (m.index ?? 0) - 40), (m.index ?? 0)))) {
+          // still allow "Warehouse A: 100" style (place word carries the hint)
+          if (!/warehouse|factory|plant|supplier|depot|store|supply|stock/i.test(m[1])) continue;
+        }
+        // guard: lazy captures like "I have a warehouse A" (from "...with 100 units")
+        // are not places — the real place ("warehouse A") is caught by the keyword pattern
+        if (/\b(have|has|with|and|or)\b/i.test(m[1]) && !/^(factory|warehouse|plant|supplier|depot|origin|store|shop|city|customer)\b/i.test(m[1])) continue;
         pushUnique(sources, m[1], m[2], 's');
       }
     }
   }
-  // 2) explicit demand phrasing (free-form: "Store X needs 120", "demand at Y is 130")
+  // 2) explicit demand phrasing, any wording: "Store X needs 120",
+  //    "demand at Y is 130", "Y wants 50", "120 units for X", "X: 120 needed"
   const demPatterns = [
     /([A-Za-z][\w\- ]*?)\s+(?:needs?\s+demand|requires?\s+demand|has\s+demand|demand)\s+(?:of\s+|is\s+)?(\d+(?:\.\d+)?)/gi,
     /(?:demand|need|needs|requirement)\s+(?:at|for|of|from)\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*(\d+(?:\.\d+)?)/gi,
     /(store|shop|city|customer|retailer|destination|market|client)\s+([A-Za-z0-9\- ]*?)\s*(?:needs?|requires?|demands?|wants?|orders?|takes?)?\s*(?:demand|units?|need)?\s*(?:of\s*|is\s*|:|=)?\s*(\d+(?:\.\d+)?)\s*(?:units?)?/gi,
-    /([A-Za-z][\w\- ]*?)\s+(?:needs?|requires?|demands?|orders?)\s+(\d+(?:\.\d+)?)\s*(?:units?)?(?!\s*(?:profit|margin))/gi,
+    /([A-Za-z][\w\- ]*?)\s+(?:needs?|requires?|demands?|orders?|wants?|takes?|receives?)\s+(\d+(?:\.\d+)?)\s*(?:units?)?(?!\s*(?:profit|margin))/gi,
+    /(\d+(?:\.\d+)?)\s*units?\s+(?:for|to|at)\s+([A-Za-z][\w\- ]*?)(?=\s*(?:and|,|;|\.|$))/gi,
   ];
   for (const re of demPatterns) {
     re.lastIndex = 0;
     while ((m = re.exec(text)) !== null) {
+      // production demand caps ("Demand for A at most 40") are never shipping destinations
+      if (/at most|maximum|\bmax\b|up to|no more than|cannot exceed|\blimit/i.test(m[0])) continue;
       if (m.length === 4) {
         const place = `${m[1]} ${m[2]}`.trim();
         // guard: skip production-style "Demand for X at most N" (no adjacent number after 'demand')
         if (/at most|maximum|^demand for/i.test(m[0]) && !/\d+\s*$/.test(m[0].trim())) continue;
         pushUnique(destinations, place, m[3], 'd');
+      } else if (/^\d/.test((m[1] ?? '').trim()) && m.length === 3 && /for|to|at/i.test(m[0])) {
+        // "120 units for X" -> groups are (qty, place)
+        if (/profit|margin|machine|labo?r|oven|wood|chips/i.test(m[0])) continue;
+        pushUnique(destinations, m[2], m[1], 'd');
       } else {
         if (/demand for/i.test(m[0]) && /at most|maximum|max/i.test(text)) continue;
         // guard: generic "X needs N" must not fire on "X needs demand N" (verb is 'demand')
@@ -565,7 +644,8 @@ export function parseTransportation(text: string): TransportData | null {
     if (srcNorms.has(norm(destinations[i].name))) destinations.splice(i, 1);
   }
   if (sources.length === 0 || destinations.length === 0) return null;
-  // 3) costs: "A to X costs 4", "A -> X = 4", "shipping from A to X is $4 per unit", "A-X: 4"
+  // 3) costs, any wording: "A to X costs 4", "A -> X = 4", "A-X: 4",
+  //    "shipping from A to X is $4 per unit", "$4 from A to X", "cost from A to X is 4"
   const costs: Record<string, Record<string, number>> = {};
   const srcNames = sources.map((s) => s.name);
   const dstNames = destinations.map((d) => d.name);
@@ -595,10 +675,24 @@ export function parseTransportation(text: string): TransportData | null {
   const costPatterns = [
     /([A-Za-z][\w\- ]*?)\s*(?:->|→|—|–|-)\s*([A-Za-z][\w\- ]*?)\s*(?:costs?|costing|price|rate|freight|charge)?\s*(?:is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)(?:\s*per unit)?/gi,
     /([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)\s*(?:costs?|costing|price|rate|freight|charge|fare)?\s*(?:is|:|=|of)?\s*\$?\s*(\d+(?:\.\d+)?)(?:\s*per unit)?/gi,
+    /(?:cost|price|rate|freight|charge|fare)\s+(?:from|of|for)\s+([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)(?:\s*per unit)?/gi,
+    /\$?\s*(\d+(?:\.\d+)?)\s*(?:per unit\s+)?from\s+([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)(?=\s*(?:and|,|;|\.|$))/gi,
+    /from\s+([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)\s*(?:costs?|is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)(?:\s*per unit)?/gi,
   ];
   for (const re of costPatterns) {
     re.lastIndex = 0;
     while ((m = re.exec(text)) !== null) {
+      // "$4 from A to X" / "$4 per unit from A to X": first group is the cost number
+      if (/^\d+(?:\.\d+)?$/.test((m[1] ?? '').trim())) {
+        const cost = parseFloat(m[1]);
+        const s = matchName(m[2], srcNames);
+        const d = matchName(m[3], dstNames);
+        if (s && d && Number.isFinite(cost)) {
+          costs[s] = costs[s] ?? {};
+          if (!(d in costs[s])) costs[s][d] = cost;
+        }
+        continue;
+      }
       const s = matchName(m[1], srcNames);
       const d = matchName(m[2], dstNames);
       if (s && d) {
@@ -617,6 +711,231 @@ export function parseTransportation(text: string): TransportData | null {
     demand: (d as unknown as { demand: number }).demand ?? d.supply,
   }));
   return { sources: fixedSources, destinations: fixedDests, costs };
+}
+
+/** Best-effort transport understanding even when the problem is incomplete.
+    Always returns what was found (possibly empty) plus the missing route pairs. */
+export interface TransportPartial {
+  sources: { name: string; supply: number }[];
+  destinations: { name: string; demand: number }[];
+  costs: Record<string, Record<string, number>>;
+  missingRoutes: { source: string; destination: string }[];
+  costCount: number;
+  costNeeded: number;
+}
+
+export function parseTransportationPartial(text: string): TransportPartial {
+  // Reuse the full parser's extraction but tolerate missing pieces.
+  const full = parseTransportation(text);
+  if (full) {
+    return {
+      sources: full.sources,
+      destinations: full.destinations,
+      costs: full.costs,
+      missingRoutes: [],
+      costCount: full.sources.length * full.destinations.length,
+      costNeeded: full.sources.length * full.destinations.length,
+    };
+  }
+  // Partial: extract sources/destinations with a lighter touch. Temporarily
+  // patch: call internal extraction by relaxing the cost requirement.
+  // We re-run source/dest regexes via a synthetic transport attempt:
+  const sources: { name: string; supply: number }[] = [];
+  const destinations: { name: string; demand: number }[] = [];
+  const seen = new Set<string>();
+  const push = (arr: { name: string; supply: number }[] | { name: string; demand: number }[], name: string, qty: string, kind: 's' | 'd') => {
+    const cleaned = cleanNodeName(name);
+    if (!cleaned) return;
+    if (/^(we|they|you|he|she|it|there|here|this|that|they have|we have)$/i.test(cleaned)) return;
+    const key = kind + ':' + norm(cleaned);
+    if (seen.has(key)) return;
+    seen.add(key);
+    const qtyNum = parseFloat(qty);
+    if (kind === 's') (arr as { name: string; supply: number }[]).push({ name: cleaned, supply: qtyNum });
+    else (arr as { name: string; demand: number }[]).push({ name: cleaned, demand: qtyNum });
+  };
+  let m: RegExpExecArray | null;
+  const supRes = [
+    /([A-Za-z][\w\- ]*?)\s+(?:has\s+supply|suppl\w*(?:ies)?|supply)\s+(?:of\s+)?(\d+(?:\.\d+)?)/gi,
+    /(?:supply|stock|inventory|capacity|available)\s+(?:at|from|of)\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*(\d+(?:\.\d+)?)/gi,
+    /(factory|warehouse|plant|supplier|depot|origin)\s+([A-Za-z0-9\- ]*?)\s*(?:has|holds?|stocks?|with)?\s*(?:supply|stock|inventory|capacity|available|units?)?\s*(?:of\s*|is\s*|:|=)?\s*(\d+(?:\.\d+)?)\s*(?:units?)?/gi,
+    /([A-Za-z][\w\- ]*?)\s*(?:can\s+supply|can\s+ship|ships?|sends?)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)/gi,
+    /([A-Za-z][\w\- ]*?)\s*(?:has|holds?)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*units?/gi,
+  ];
+  for (const re of supRes) {
+    re.lastIndex = 0;
+    while ((m = re.exec(text)) !== null) {
+      if (m.length === 4) {
+        const place = `${m[1]} ${m[2]}`.trim();
+        push(sources, place, m[3], 's');
+        continue;
+      }
+      if (/\b(have|has|with|and|or)\b/i.test(m[1]) && !/^(factory|warehouse|plant|supplier|depot|origin|store|shop|city|customer)\b/i.test(m[1])) continue;
+      push(sources, m[1], m[2], 's');
+    }
+  }
+  const demRes = [
+    /(?:demand|need|needs|requirement)\s+(?:at|for|of|from)\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*(\d+(?:\.\d+)?)/gi,
+    /([A-Za-z][\w\- ]*?)\s+(?:needs?|requires?|demands?|orders?|wants?)\s+(\d+(?:\.\d+)?)/gi,
+  ];
+  for (const re of demRes) {
+    re.lastIndex = 0;
+    while ((m = re.exec(text)) !== null) {
+      if (/at most|maximum|\bmax\b|up to|no more than|cannot exceed|\blimit/i.test(m[0])) continue;
+      if (/profit|margin|machine|labo?r|oven|wood|chips/i.test(m[0])) continue;
+      push(destinations, m[1], m[2], 'd');
+    }
+  }
+  const srcNorms = new Set(sources.map((s) => norm(s.name)));
+  for (let i = destinations.length - 1; i >= 0; i--) {
+    if (srcNorms.has(norm(destinations[i].name))) destinations.splice(i, 1);
+  }
+  // costs found (best effort name match by last word)
+  const costs: Record<string, Record<string, number>> = {};
+  const matchLoose = (token: string, known: string[]): string | null => {
+    const t = norm(token);
+    const exact = known.find((k) => norm(k) === t);
+    if (exact) return exact;
+    const last = known.filter((k) => (norm(k).split(' ').pop() ?? '') === t || (norm(k).split(' ').pop() ?? '') === t.split(' ').pop());
+    if (last.length === 1) return last[0];
+    return null;
+  };
+  const costRes = [
+    /([A-Za-z][\w\- ]*?)\s*(?:->|to)\s*([A-Za-z][\w\- ]*?)\s*(?:costs?|is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)/gi,
+    /(?:cost|price)\s+(?:from|of|for)\s+([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)/gi,
+  ];
+  const srcNames = sources.map((s) => s.name);
+  const dstNames = destinations.map((d) => d.name);
+  for (const re of costRes) {
+    re.lastIndex = 0;
+    while ((m = re.exec(text)) !== null) {
+      const s = matchLoose(m[1], srcNames);
+      const d = matchLoose(m[2], dstNames);
+      if (s && d) {
+        costs[s] = costs[s] ?? {};
+        if (!(d in costs[s])) costs[s][d] = parseFloat(m[3]);
+      }
+    }
+  }
+  const fixedSources = sources.map((s) => ({ name: s.name, supply: (s as unknown as { supply: number }).supply }));
+  const fixedDests = destinations.map((d) => ({ name: d.name, demand: (d as unknown as { demand: number }).demand ?? (d as unknown as { supply: number }).supply }));
+  const missingRoutes: { source: string; destination: string }[] = [];
+  for (const s of fixedSources) {
+    for (const d of fixedDests) {
+      if (!costs[s.name]?.[d.name]) missingRoutes.push({ source: s.name, destination: d.name });
+    }
+  }
+  const costCount = fixedSources.length * fixedDests.length - missingRoutes.length;
+  return { sources: fixedSources, destinations: fixedDests, costs, missingRoutes, costCount, costNeeded: fixedSources.length * fixedDests.length };
+}
+
+/** Best-effort production understanding for incomplete prompts. */
+export function parseProductionPartial(text: string): {
+  products: { name: string; profit: number | null }[];
+  capacities: Record<string, number>;
+} {
+  const clean = text.replace(/\$/g, '');
+  const products: { name: string; profit: number | null }[] = [];
+  const seen = new Set<string>();
+  for (const raw of clean.split(/[.\n;]+/)) {
+    const sentence = raw.trim();
+    if (!sentence) continue;
+    if (!/profit|margin|earn|contribution|gain|revenue|makes?|yields?|gives?|price/i.test(sentence)) continue;
+    const profit = profitFromSentence(sentence);
+    // keep entries even when the profit number itself is missing ("chairs earn good profit")
+    const name = productNameFromSentence(sentence, '');
+    if (!name) continue;
+    const key = canonKey(name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    products.push({ name, profit });
+  }
+  let capacities: Record<string, number> = {};
+  try {
+    capacities = parseCapacitiesFree(clean);
+  } catch {
+    capacities = {};
+  }
+  return { products, capacities };
+}
+
+/** One-line trace of what the solver thinks the user is asking. */
+export function traceProblem(text: string): { detected: DetectedType; understood: string[]; missing: string[] } {
+  const hasProfitWords = /profit|margin|earn|contribution|gain|revenue/i.test(text);
+  const hasShipNouns = /warehouse|factory|plant|supplier|depot|store|shop|ship|freight|transport|deliver|customer|retailer/i.test(text);
+  // Production-first so "Demand for A at most 40" never traces as shipping.
+  if (hasProfitWords && !hasShipNouns) {
+    const prodOnly = parseProduction(text);
+    if (prodOnly) {
+      return {
+        detected: 'production',
+        understood: [
+          `products: ${prodOnly.products.map((p) => `${p.name} (profit ${p.profit})`).join(', ')}`,
+          `limits: ${Object.entries(prodOnly.capacities).map(([k, v]) => `${k} (${v})`).join(', ')}`,
+        ],
+        missing: [],
+      };
+    }
+    const pp = parseProductionPartial(text);
+    const understood: string[] = [];
+    const missing: string[] = [];
+    if (pp.products.length > 0) understood.push(`products: ${pp.products.map((p) => (p.profit != null ? `${p.name} (profit ${p.profit})` : p.name)).join(', ')}`);
+    else missing.push('products + profit each');
+    if (Object.keys(pp.capacities).length > 0) understood.push(`limits: ${Object.entries(pp.capacities).map(([k, v]) => `${k} (${v})`).join(', ')}`);
+    else missing.push('what limits you');
+    return { detected: 'production?', understood, missing };
+  }
+  const t = parseTransportation(text);
+  if (t) {
+    return {
+      detected: 'transportation',
+      understood: [
+        `sources: ${t.sources.map((s) => `${s.name} (${s.supply})`).join(', ')}`,
+        `destinations: ${t.destinations.map((d) => `${d.name} (${d.demand})`).join(', ')}`,
+        `costs: ${Object.values(t.costs).reduce((a, r) => a + Object.keys(r).length, 0)} routes`,
+      ],
+      missing: [],
+    };
+  }
+  if (isTransportLike(text)) {
+    const p = parseTransportationPartial(text);
+    const understood: string[] = [];
+    const missing: string[] = [];
+    if (p.sources.length > 0) understood.push(`sources: ${p.sources.map((s) => `${s.name} (${s.supply})`).join(', ')}`);
+    else missing.push('supply quantities (e.g. "Warehouse A has 100")');
+    if (p.destinations.length > 0) understood.push(`destinations: ${p.destinations.map((d) => `${d.name} (${d.demand})`).join(', ')}`);
+    else missing.push('demand quantities (e.g. "Store X needs 120")');
+    if (p.costCount > 0) understood.push(`route costs found: ${p.costCount}/${p.costNeeded}`);
+    if (p.missingRoutes.length > 0 && p.sources.length > 0 && p.destinations.length > 0) {
+      missing.push(`route costs: ${p.missingRoutes.slice(0, 4).map((r) => `${r.source} to ${r.destination}`).join(', ')}${p.missingRoutes.length > 4 ? ` (+${p.missingRoutes.length - 4} more)` : ''}`);
+    } else if (p.costCount === 0 && p.sources.length > 0 && p.destinations.length > 0) {
+      missing.push('every route cost (e.g. "A to X costs 4")');
+    }
+    return { detected: 'transportation?', understood, missing };
+  }
+  const prod = parseProduction(text);
+  if (prod) {
+    return {
+      detected: 'production',
+      understood: [
+        `products: ${prod.products.map((p) => `${p.name} (profit ${p.profit})`).join(', ')}`,
+        `limits: ${Object.entries(prod.capacities).map(([k, v]) => `${k} (${v})`).join(', ')}`,
+      ],
+      missing: [],
+    };
+  }
+  if (/profit|margin|earn|contribution|makes?|produces?|manufactures?|capacity|available|machine|labo?r|wood|oven|material/i.test(text)) {
+    const pp = parseProductionPartial(text);
+    const understood: string[] = [];
+    const missing: string[] = [];
+    if (pp.products.length > 0) understood.push(`products: ${pp.products.map((p) => (p.profit != null ? `${p.name} (profit ${p.profit})` : p.name)).join(', ')}`);
+    else missing.push('products + profit each (e.g. "chairs earn 40 each")');
+    if (Object.keys(pp.capacities).length > 0) understood.push(`limits: ${Object.entries(pp.capacities).map(([k, v]) => `${k} (${v})`).join(', ')}`);
+    else missing.push('what limits you (e.g. "we have 100 wood and 80 labor")');
+    return { detected: 'production?', understood, missing };
+  }
+  if (GAME_WORDS.test(text)) return { detected: 'game?', understood: ['competitive / game-theory wording'], missing: ['two choices + four payoffs for Player 1'] };
+  return { detected: 'unknown', understood: [], missing: ['what you make or ship, your limits, and your numbers'] };
 }
 
 export function solveTransportation(data: TransportData): Analysis {
@@ -823,28 +1142,137 @@ export function solveLocally(problem: string): Analysis {
   const game = parseGame(text);
   if (game) return game;
 
-  const transportWords = isTransportLike(text);
-  const t = parseTransportation(text);
-  if (t) return solveTransportation(t);
-  if (transportWords) {
-    // If it really looks like transport but costs are missing, explain once.
-    const hasSupply = /suppl|supply|stock|inventory|capacity|ships?|sends?|warehouse|factory|plant/i.test(text);
-    const hasDemand = /demand|needs?|requires?|orders?|wants?|takes?|receives?|customers?|stores?|destinations?/i.test(text);
-    if (hasSupply && hasDemand) {
-      throw new Error(
-        'I can see this is a shipping problem, but I need every route cost too — e.g. "A to X costs 4". Add supplies, demands, and all route costs in any wording and I will solve it.',
-      );
+  // Production-first: profit wording without shipping nouns is never transport
+  // (stops "Demand for A at most 40" / "We have 100 units" misfiring as shipping).
+  const hasProfitWords = /profit|margin|earn|contribution|gain|revenue/i.test(text);
+  const hasShipNouns = /warehouse|factory|plant|supplier|depot|store|shop|ship|freight|transport|deliver|customer|retailer/i.test(text);
+  if (hasProfitWords && !hasShipNouns) {
+    const prodOnly = parseProduction(text);
+    if (prodOnly) return solveProduction(prodOnly.products, prodOnly.capacities);
+    // fall through to the friendly production clarification below
+  } else {
+    const transportWords = isTransportLike(text);
+    const t = parseTransportation(text);
+    if (t) return solveTransportation(t);
+    if (transportWords) {
+    // Shipping intent detected but something is missing — trace exactly what,
+    // so the UI can show understanding + one-line fix instead of a dead end.
+    const p = parseTransportationPartial(text);
+    const fmtList = (items: string[]) => items.join(', ');
+    if (p.sources.length > 0 && p.destinations.length > 0 && p.missingRoutes.length > 0) {
+      const missingStr = p.missingRoutes.slice(0, 4).map((r) => `${r.source} to ${r.destination} costs ?`).join(', ');
+      const first = p.missingRoutes[0];
+      const fixBit = `${first.source} to ${first.destination} costs 5`;
+      const understood = [
+        `sources: ${fmtList(p.sources.map((s) => `${s.name} (${s.supply})`))}`,
+        `destinations: ${fmtList(p.destinations.map((d) => `${d.name} (${d.demand})`))}`,
+        `route costs so far: ${p.costCount}/${p.costNeeded}`,
+      ];
+      const missing = [`route costs: ${p.missingRoutes.map((r) => `${r.source} → ${r.destination}`).join(', ')}`];
+      throw new ClarificationError({
+        message:
+          `Got it — this is a shipping problem and I understood most of it (${fmtList(understood)}). ` +
+          `I'm still missing ${p.missingRoutes.length} route cost${p.missingRoutes.length > 1 ? 's' : ''}: ${missingStr}${p.missingRoutes.length > 4 ? '…' : ''}. ` +
+          `Just add them in your own words — e.g. "${fixBit}" — and I'll solve it instantly.`,
+        detected: 'transportation?',
+        understood,
+        missing,
+        fixExample: `Shipping costs: ${p.missingRoutes.map((r) => `${r.source} to ${r.destination} costs 5`).join(', ')}.`,
+        appendFix: ` Shipping costs: ${p.missingRoutes.map((r) => `${r.source} to ${r.destination} costs 5`).join(', ')}.`,
+      });
+    }
+    if (p.sources.length > 0 || p.destinations.length > 0) {
+      const understood: string[] = [];
+      if (p.sources.length > 0) understood.push(`sources: ${fmtList(p.sources.map((s) => `${s.name} (${s.supply})`))}`);
+      if (p.destinations.length > 0) understood.push(`destinations: ${fmtList(p.destinations.map((d) => `${d.name} (${d.demand})`))}`);
+      if (p.costCount > 0) understood.push(`costs found: ${p.costCount}`);
+      const missing: string[] = [];
+      if (p.sources.length === 0) missing.push('who supplies how much (e.g. "Warehouse A has 100")');
+      if (p.destinations.length === 0) missing.push('who needs how much (e.g. "Store X needs 120")');
+      if (p.sources.length > 0 && p.destinations.length > 0) missing.push('every route cost (e.g. "A to X costs 4")');
+      throw new ClarificationError({
+        message:
+          `Got it — this is a shipping problem${understood.length > 0 ? ` (${fmtList(understood)})` : ''}. ` +
+          `To solve it I still need ${missing.join(' + ')} — in any wording you like. ` +
+          `Example that always works: "Warehouse A has supply 100. Store X needs 120. A to X costs 4."`,
+        detected: 'transportation?',
+        understood,
+        missing,
+        fixExample: 'Warehouse A has supply 100. Warehouse B has supply 150. Store X needs 120. Store Y needs 130. Shipping costs: A to X costs 4, A to Y costs 6, B to X costs 5, B to Y costs 3.',
+        appendFix: '',
+      });
+    }
+    // Vague shipping intent with no numbers at all — guide, don't scold.
+    throw new ClarificationError({
+      message:
+        `Got it — you want to optimize shipping. Tell me in your own words: (1) who supplies how much, (2) who needs how much, (3) what each route costs. ` +
+        `Example: "Warehouse A has 100 units, Store X needs 120 units, shipping from A to X costs 4 per unit." Any wording with the same numbers works.`,
+      detected: 'transportation?',
+      understood: ['shipping intent'],
+      missing: ['supplies', 'demands', 'route costs'],
+      fixExample: 'Warehouse A has supply 100. Store X needs demand 120. Shipping costs: A to X costs 4.',
+      appendFix: '',
+    });
     }
   }
 
   const prod = parseProduction(text);
   if (prod) return solveProduction(prod.products, prod.capacities);
-  if (GAME_WORDS.test(text)) {
-    throw new Error(
-      'This looks like a game-theory problem. Tell me the two choices (e.g. "choose Attack or Defend") and the four payoffs for Player 1, in any wording, and I will find the optimal mixed strategy.',
-    );
+  // Production intent but incomplete — say exactly which piece is missing,
+  // using the user's own product/resource names when we have them.
+  if (/profit|margin|earn|contribution|gain|revenue|makes?|produces?|manufactures?|capacity|available|machine|labo?r|wood|oven|material|assembl/i.test(text)) {
+    const pp = parseProductionPartial(text);
+    if (pp.products.length > 0 || Object.keys(pp.capacities).length > 0) {
+      const understood: string[] = [];
+      if (pp.products.length > 0) {
+        understood.push(`products: ${pp.products.map((p) => (p.profit != null ? `${p.name} (profit ${p.profit})` : `${p.name}`)).join(', ')}`);
+      }
+      if (Object.keys(pp.capacities).length > 0) {
+        understood.push(`limits: ${Object.entries(pp.capacities).map(([k, v]) => `${k} (${v})`).join(', ')}`);
+      }
+      const missing: string[] = [];
+      const needProfits = pp.products.some((p) => p.profit == null);
+      if (pp.products.length === 0 || needProfits) missing.push('profit per item (e.g. "each chair earns 40")');
+      const needUsage = true; // usage detail almost always the missing piece in partial parses
+      if (Object.keys(pp.capacities).length === 0) missing.push('what limits you (e.g. "we have 100 wood and 80 labor")');
+      else if (pp.products.length > 0) missing.push('what each item needs (e.g. "each chair needs 2 wood and 1 labor")');
+      void needUsage;
+      const firstProd = pp.products[0]?.name ?? 'chairs';
+      // naive singular for a natural example ("chairs" -> "Each chair needs ...")
+      const singular = /[^s]s$/i.test(firstProd) && firstProd.length > 3 ? firstProd.slice(0, -1) : firstProd;
+      throw new ClarificationError({
+        message:
+          `Got it — this is a production problem${understood.length > 0 ? ` (${understood.join('; ')})` : ''}. ` +
+          `To find your optimal plan I still need ${missing.join(' + ')}. ` +
+          `Just continue in your own words — e.g. "Each ${singular} needs 2 wood and 1 labor. We have 100 wood and 80 labor." — and I'll solve it.`,
+        detected: 'production?',
+        understood,
+        missing,
+        fixExample: `Each ${singular} needs 2 wood and 1 labor. We have 100 wood and 80 labor available.`,
+        appendFix: ` Each ${singular} needs 2 wood and 1 labor. We have 100 wood and 80 labor available.`,
+      });
+    }
   }
-  throw new Error(
-    'I could not build an optimization model from that text. I only solve production, transportation, and game-theory problems — not general math. Try e.g.: "We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor." Any wording with the same numbers works.',
-  );
+  if (GAME_WORDS.test(text)) {
+    throw new ClarificationError({
+      message:
+        'This looks like a game-theory problem. Tell me the two choices (e.g. "choose Attack or Defend") and the four payoffs for Player 1, in any wording, and I will find the optimal mixed strategy.',
+      detected: 'game?',
+      understood: ['competitive / game-theory wording'],
+      missing: ['two choices + four payoffs'],
+      fixExample: 'Two players choose Attack or Defend. Payoffs are 3, -1, -2 and 2.',
+      appendFix: '',
+    });
+  }
+  // Truly vague / general — trace intent and invite any wording.
+  throw new ClarificationError({
+    message:
+      'Tell me about your problem in your own words and I\'ll work out the rest — for example: "We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor." ' +
+      'Or shipping: "Warehouse A has 100, Store X needs 120, A to X costs 4." I handle production, transportation, and game-theory problems (not general math).',
+    detected: 'unknown',
+    understood: [],
+    missing: ['what you make or ship, your limits, and your numbers'],
+    fixExample: 'We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor.',
+    appendFix: '',
+  });
 }

@@ -241,6 +241,21 @@ textarea:focus { border-color: rgba(62,240,176,0.65); box-shadow: 0 0 0 4px rgba
 .message { margin: 18px 0 0; padding: 15px 18px 15px 20px; border-left: 3px solid var(--mint); color: #c2f8e7; background: rgba(13,45,48,0.6); border-radius: 10px; line-height: 1.6; border-top: 1px solid rgba(255,255,255,0.06); border-right: 1px solid rgba(255,255,255,0.06); border-bottom: 1px solid rgba(255,255,255,0.06); }
 .message.error { border-left-color: #ff8f85; color: #ffd0ca; background: rgba(58,32,37,0.6); }
 
+/* ---------- LIVE TRACE + CLARIFICATION ---------- */
+.trace-hint { display: flex; align-items: flex-start; gap: 10px; margin-top: 12px; padding: 10px 14px; border-radius: 10px; font-size: 0.82rem; line-height: 1.55; color: #a9bdd2; background: rgba(106,168,255,0.07); border: 1px solid rgba(106,168,255,0.22); }
+.trace-hint strong { color: #dcebff; }
+.trace-dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 6px; flex-shrink: 0; background: var(--sky); box-shadow: 0 0 10px rgba(106,168,255,0.9); animation: pulse 2s infinite; }
+.clarify-card { margin-top: 18px; padding: 24px 26px; border-radius: 20px; border: 1px solid rgba(255,200,120,0.3); background: linear-gradient(155deg, rgba(42,32,18,0.55), rgba(15,20,35,0.95)); box-shadow: 0 24px 60px -24px rgba(0,0,0,0.8); animation: rise 0.4s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.clarify-card .eyebrow { color: #ffd9a0; }
+.clarify-text { color: #f2e4cd; line-height: 1.7; font-size: 0.93rem; margin: 8px 0 0; }
+.clarify-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+.clarify-grid > div { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 12px 16px; }
+.clarify-grid strong { display: block; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: #ffd9a0; margin-bottom: 8px; }
+.clarify-grid ul { margin: 0; padding-left: 18px; color: #cdd9e8; font-size: 0.85rem; line-height: 1.6; }
+.clarify-actions { display: flex; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+.clarify-note { display: block; margin-top: 12px; color: #8fa1b7; font-size: 0.78rem; }
+@media (max-width: 720px) { .clarify-grid { grid-template-columns: 1fr; } }
+
 /* ---------- RESULTS ---------- */
 .results {
   margin-top: 26px; padding: 34px; border-radius: 26px;

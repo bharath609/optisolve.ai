@@ -41,10 +41,15 @@ def _is_complex_problem(problem: str) -> bool:
 
 
 FREE_FORM_GUIDANCE = """Users phrase problems freely in their own words — never require rigid templates like "Product A".
-Understand synonyms: profit = profit/margin/earn/yield/contribution/gain/revenue/price;
-needs = needs/uses/requires/consumes/takes; have = have/available/in stock/capacity/total/limited to.
+They may write casually ("I run a bakery...", "I ship from...", "my factory has...").
+Understand synonyms: profit = profit/margin/earn/yield/contribution/gain/revenue/makes/gives/price;
+needs = needs/uses/requires/consumes/takes/spends; have = have/available/in stock/on hand/capacity/total/limited to/left.
 Product names can be anything (chairs, bread, phones, X1...). Resource names can be anything
-(wood, machine hours, labour, oven...). Normalize them, keep numbers exact, never invent numbers.
+(wood, machine hours, labour, oven...). Places can be anything (Warehouse A, Mumbai depot, Store X).
+Costs can appear as "A to X costs 4", "A->X 4", "$4 from A to X", "cost from A to X is 4".
+Normalize them, keep numbers exact, never invent numbers.
+First trace the problem: production (make things for profit with limited resources),
+transportation (ship from supplies to demands with route costs), or game theory (two players, payoffs).
 If the text is general math (equations, calculus) rather than production/transportation/game-theory
 optimization, return {"error":"unsupported"}."""
 
@@ -104,7 +109,7 @@ STOP_WORDS = {
 
 def _clean_name(raw: str) -> str:
     s = re.sub(r"\s+", " ", raw.strip())
-    s = re.sub(r"^(the|a|an|each|every|our|your|my)\s+", "", s, flags=re.I)
+    s = re.sub(r"^(the|a|an|each|every|our|your|my|and|both|from|to|at|in|of)\s+", "", s, flags=re.I)
     # strip trailing verbs/adjectives captured by lazy regexes ("Factory A can" -> "Factory A")
     s = re.sub(
         r"\s+(can|has|have|with|holds?|stocks?|suppl\w*|supply|produces?|makes?|offers?|provides?|needs?|requires?|demands?|demand|orders?|wants?)$",
@@ -167,7 +172,12 @@ def _product_name_from_sentence(sentence: str, fallback: str) -> str:
         sentence, re.I,
     )
     if m and m.group(1).strip().lower() not in STOP_WORDS:
-        return _clean_name(m.group(1))
+        cand = _clean_name(m.group(1))
+        cand = re.sub(r"^(we|they|you|i)\s+", "", cand, flags=re.I).strip()
+        cand = re.sub(r"^(make|makes|produces?|manufactures?|sells?|offers?|builds?)\s+", "", cand, flags=re.I).strip()
+        cand = re.sub(r"\s+(that|which|who)$", "", cand, flags=re.I).strip()
+        if cand and cand.lower() not in STOP_WORDS:
+            return cand
     m = re.search(
         r"(?:profit|margin|earning|contribution|gain)(?:\s*(?:per|for|of|on))?\s+(?:of\s+)?([A-Za-z][A-Za-z0-9\- ]{0,28}?)\s+(?:is|=|:|of)\s*\$?\d",
         sentence, re.I,
@@ -524,11 +534,57 @@ def _extract_with_fallback(problem: str) -> BusinessModel:
     if re.search(r"solve\s+(for\s+)?x\b|derivative|integral|quadratic|differentiate|integrate|simplify", text, re.I):
         raise ValueError("OptiSolve only solves optimization problems — production planning, transportation, and game theory — not general math. Describe profits with limited resources, shipping supplies/demands/costs, or a game payoff, in any wording.")
     if re.search(r"warehouse|ship|shipping|transport|freight|supplier|customer|distribution|supply|demand", text, re.I):
-        raise ValueError("I can see a shipping problem, but I need supplies, demands, and every route cost too — e.g. 'Warehouse A supplies 100, Store X needs 120, A to X costs 4'. Add those in any wording and try again.")
-    raise ValueError("I could not build an optimization model from that text. I only solve production, transportation, and game-theory problems — not general math. Try e.g.: 'We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor.' Any wording with the same numbers works.")
+        partial = _diagnose_transportation(text)
+        if partial["sources"] and partial["destinations"] and partial["missing_routes"]:
+            missing = ", ".join(f"{s} to {d} costs ?" for s, d in partial["missing_routes"][:4])
+            first_s, first_d = partial["missing_routes"][0]
+            found = (
+                f"sources {', '.join(f'{n} ({q:g})' for n, q in partial['sources'])}; "
+                f"destinations {', '.join(f'{n} ({q:g})' for n, q in partial['destinations'])}; "
+                f"costs {partial['have']}/{partial['needed']} found"
+            )
+            raise ValueError(
+                f"Got it — this is a shipping problem and I understood most of it ({found}). "
+                f"I'm still missing {len(partial['missing_routes'])} route cost(s): {missing}. "
+                f"Just add them in your own words — e.g. \"{first_s} to {first_d} costs 5\" — and I'll solve it instantly."
+            )
+        if partial["sources"] or partial["destinations"]:
+            bits = []
+            if partial["sources"]:
+                bits.append("sources " + ", ".join(f"{n} ({q:g})" for n, q in partial["sources"]))
+            if partial["destinations"]:
+                bits.append("destinations " + ", ".join(f"{n} ({q:g})" for n, q in partial["destinations"]))
+            raise ValueError(
+                f"Got it — this is a shipping problem ({'; '.join(bits)}). "
+                "To solve it I still need supplies, demands, and every route cost — e.g. "
+                "'Warehouse A supplies 100, Store X needs 120, A to X costs 4'. Add those in any wording and try again."
+            )
+        raise ValueError(
+            "Got it — you want to optimize shipping. Tell me in your own words: (1) who supplies how much, "
+            "(2) who needs how much, (3) what each route costs. Example: "
+            "'Warehouse A has 100 units, Store X needs 120 units, shipping from A to X costs 4 per unit.' "
+            "Any wording with the same numbers works."
+        )
+    if re.search(r"profit|margin|earn|contribution|gain|revenue|produces?|manufactures?|capacity|available|machine|labo?r|wood|oven", text, re.I):
+        partial = _diagnose_production(text)
+        if partial["products"] or partial["capacities"]:
+            bits = []
+            if partial["products"]:
+                bits.append("products " + ", ".join(partial["products"]))
+            if partial["capacities"]:
+                bits.append("limits " + ", ".join(f"{k} ({v:g})" for k, v in partial["capacities"].items()))
+            first = partial["products"][0] if partial["products"] else "chairs"
+            singular = first[:-1] if re.search(r"[^s]s$", first, re.I) and len(first) > 3 else first
+            raise ValueError(
+                f"Got it — this is a production problem ({'; '.join(bits)}). "
+                f"To find your optimal plan, add what each item needs and what limits you — e.g. "
+                f"\"Each {singular} needs 2 wood and 1 labor. We have 100 wood and 80 labor.\" Any wording works."
+            )
+    raise ValueError("Tell me about your problem in your own words and I'll work out the rest — e.g.: 'We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor.' Or shipping: 'Warehouse A has 100, Store X needs 120, A to X costs 4.' I handle production, transportation, and game-theory problems (not general math).")
 
 
-def _parse_transportation_free(text: str):
+def _diagnose_transportation(text: str) -> dict:
+    """Best-effort trace of shipping intent for friendly clarification messages."""
     sources: list[tuple[str, float]] = []
     destinations: list[tuple[str, float]] = []
     seen: set[str] = set()
@@ -546,6 +602,93 @@ def _parse_transportation_free(text: str):
     for pattern in [
         r"([A-Za-z][\w\- ]*?)\s+(?:has\s+supply|suppl\w*(?:ies)?|supply)\s+(?:of\s+)?(\d+(?:\.\d+)?)",
         r"(?:supply|stock|inventory|capacity|available)\s+(?:at|from|of)\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*(\d+(?:\.\d+)?)",
+        r"(factory|warehouse|plant|supplier|depot|origin)\s+([A-Za-z0-9\- ]*?)\s*(?:has|holds?|stocks?|with)?\s*(?:supply|stock|inventory|capacity|available|units?)?\s*(?:of\s*|is\s*|:|=)?\s*(\d+(?:\.\d+)?)\s*(?:units?)?",
+        r"([A-Za-z][\w\- ]*?)\s+(?:needs?|requires?|demands?|orders?|wants?)\s+(\d+(?:\.\d+)?)",
+    ]:
+        for m in re.finditer(pattern, text, re.I):
+            if "needs" in m.group(0).lower() or "require" in m.group(0).lower() or "demand" in m.group(0).lower() or "order" in m.group(0).lower() or "want" in m.group(0).lower():
+                if re.search(r"profit|margin|machine|labo?r|oven|wood|chips", m.group(0), re.I):
+                    continue
+                push(destinations, m.group(1), float(m.group(2)), "d")
+            elif len(m.groups()) == 3:
+                push(sources, f"{m.group(1)} {m.group(2)}".strip(), float(m.group(3)), "s")
+            else:
+                push(sources, m.group(1), float(m.group(2)), "s")
+    # route costs found (loose last-word match so "A"/"Warehouse A" align)
+    costs_found: set[tuple[str, str]] = set()
+    for m in re.finditer(
+        r"([A-Za-z][\w\- ]*?)\s*(?:->|to)\s*([A-Za-z][\w\- ]*?)\s*(?:costs?|is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)",
+        text, re.I,
+    ):
+        s_tok = re.sub(r"\s+", " ", m.group(1).strip().lower())
+        d_tok = re.sub(r"\s+", " ", m.group(2).strip().lower())
+        for s, _ in sources:
+            for d, _ in destinations:
+                s_last = re.sub(r"\s+", " ", s.strip().lower()).split(" ")[-1]
+                d_last = re.sub(r"\s+", " ", d.strip().lower()).split(" ")[-1]
+                if s_last == s_tok.split(" ")[-1] and d_last == d_tok.split(" ")[-1]:
+                    costs_found.add((s, d))
+    missing_routes = [(s, d) for s, _ in sources for d, _ in destinations if (s, d) not in costs_found]
+    needed = len(sources) * len(destinations)
+    return {"sources": sources, "destinations": destinations, "missing_routes": missing_routes,
+            "have": len(costs_found), "needed": needed}
+
+
+def _diagnose_production(text: str) -> dict:
+    """Best-effort trace of production intent for friendly clarification messages."""
+    products: list[str] = []
+    clean = text.replace("$", "")
+    for raw in re.split(r"[.\n;]+", clean):
+        sentence = raw.strip()
+        if not sentence or not re.search(r"profit|margin|earn|contribution|gain|revenue", sentence, re.I):
+            continue
+        try:
+            name = _product_name_from_sentence(sentence, "")
+        except Exception:
+            name = ""
+        if name and name not in products:
+            products.append(name)
+    try:
+        capacities = _parse_capacities_free(clean)
+    except Exception:
+        capacities = {}
+    return {"products": products[:5], "capacities": dict(list(capacities.items())[:6])}
+
+
+def _parse_transportation_free(text: str):
+    # Production texts ("Demand for A at most 40", "We have 100 units Machine")
+    # must never be mistaken for shipping.
+    if re.search(r"profit|margin|earn|contribution|gain|revenue", text, re.I) and not re.search(
+        r"warehouse|factory|plant|supplier|depot|store|shop|ship|freight|transport|deliver|customer|retailer", text, re.I
+    ):
+        return None
+    sources: list[tuple[str, float]] = []
+    destinations: list[tuple[str, float]] = []
+    seen: set[str] = set()
+
+    def push(items: list, name: str, qty: float, kind: str):
+        cleaned = _clean_name(name)
+        if not cleaned:
+            return
+        if re.match(r"^(we|they|you|he|she|it|there|here|this|that|they have|we have)$", cleaned, re.I):
+            return
+        # lazy captures like "I have a warehouse A" (from "...with 100 units")
+        # are not places — the keyword pattern catches the real place
+        if re.search(r"\b(have|has|with|and|or)\b", cleaned, re.I) and not re.match(
+            r"^(factory|warehouse|plant|supplier|depot|origin|store|shop|city|customer)\b", cleaned, re.I
+        ):
+            return
+        key = kind + ":" + re.sub(r"\s+", " ", cleaned.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        items.append((cleaned, qty))
+
+    for pattern in [
+        r"([A-Za-z][\w\- ]*?)\s+(?:has\s+supply|suppl\w*(?:ies)?|supply)\s+(?:of\s+)?(\d+(?:\.\d+)?)",
+        r"(?:supply|stock|inventory|capacity|available)\s+(?:at|from|of)\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*(\d+(?:\.\d+)?)",
+        r"([A-Za-z][\w\- ]*?)\s*(?:can\s+supply|can\s+ship|can\s+send|ships?|sends?|provides?|offers?)\s+(?:up\s+to\s+|about\s+)?(\d+(?:\.\d+)?)\s*(?:units?)?",
+        r"([A-Za-z][\w\- ]*?)\s*(?:has|holds?|stocks?|with|contains?)\s+(?:up\s+to\s+|about\s+|around\s+)?(\d+(?:\.\d+)?)\s*units?\s*(?:supply|stock|inventory|available|to\s+ship|to\s+send)?",
     ]:
         for m in re.finditer(pattern, text, re.I):
             push(sources, m.group(1), float(m.group(2)), "s")
@@ -568,12 +711,18 @@ def _parse_transportation_free(text: str):
     ):
         push(destinations, f"{m.group(1)} {m.group(2)}".strip(), float(m.group(3)), "d")
     # generic "X needs 120" (but not profit lines, and not "X needs demand N")
-    for m in re.finditer(r"([A-Za-z][\w\- ]*?)\s+(?:needs?|requires?|demands?|orders?)\s+(\d+(?:\.\d+)?)\s*(?:units?)?(?!\s*(?:profit|margin))", text, re.I):
+    for m in re.finditer(r"([A-Za-z][\w\- ]*?)\s+(?:needs?|requires?|demands?|orders?|wants?|takes?|receives?)\s+(\d+(?:\.\d+)?)\s*(?:units?)?(?!\s*(?:profit|margin))", text, re.I):
+        if re.search(r"at most|maximum|\bmax\b|up to|no more than|cannot exceed|\blimit", m.group(0), re.I):
+            continue
         if re.search(r"profit|margin|machine|labo?r|oven|wood|chips", m.group(0), re.I):
             continue
         if re.search(r"\b(needs?|requires?|demands?|demand|orders?)\s*$", m.group(1), re.I):
             continue
         push(destinations, m.group(1), float(m.group(2)), "d")
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*units?\s+(?:for|to|at)\s+([A-Za-z][\w\- ]*?)(?=\s*(?:and|,|;|\.|$))", text, re.I):
+        if re.search(r"profit|margin|machine|labo?r|oven|wood|chips", m.group(0), re.I):
+            continue
+        push(destinations, m.group(2), float(m.group(1)), "d")
     src_norms = {re.sub(r"\s+", " ", s.lower()) for s, _ in sources}
     destinations = [(n, q) for n, q in destinations if re.sub(r"\s+", " ", n.lower()) not in src_norms]
     if not sources or not destinations:
@@ -614,12 +763,23 @@ def _parse_transportation_free(text: str):
     for pattern in [
         r"([A-Za-z][\w\- ]*?)\s*(?:->|→|—|–|-)\s*([A-Za-z][\w\- ]*?)\s*(?:costs?|costing|price|rate|freight|charge)?\s*(?:is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)(?:\s*per unit)?",
         r"([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)\s*(?:costs?|costing|price|rate|freight|charge|fare)?\s*(?:is|:|=|of)?\s*\$?\s*(\d+(?:\.\d+)?)(?:\s*per unit)?",
+        r"(?:cost|price|rate|freight|charge|fare)\s+(?:from|of|for)\s+([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)\s*(?:is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)(?:\s*per unit)?",
+        r"from\s+([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)\s*(?:costs?|is|:|=)?\s*\$?\s*(\d+(?:\.\d+)?)(?:\s*per unit)?",
     ]:
         for m in re.finditer(pattern, text, re.I):
             s = match_name(m.group(1), src_names)
             d = match_name(m.group(2), dst_names)
             if s and d:
                 costs.setdefault(s, {}).setdefault(d, float(m.group(3)))
+    # "$4 from A to X" word order
+    for m in re.finditer(
+        r"\$?\s*(\d+(?:\.\d+)?)\s*(?:per unit\s+)?from\s+([A-Za-z][\w\- ]*?)\s+to\s+([A-Za-z][\w\- ]*?)(?=\s*(?:and|,|;|\.|$))",
+        text, re.I,
+    ):
+        s = match_name(m.group(2), src_names)
+        d = match_name(m.group(3), dst_names)
+        if s and d:
+            costs.setdefault(s, {}).setdefault(d, float(m.group(1)))
     needed = len(sources) * len(destinations)
     have = sum(len(row) for row in costs.values())
     if have < needed:

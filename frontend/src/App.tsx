@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import './App.css'
-import { solveLocally, type Analysis } from './lib/localSolver'
+import { solveLocally, traceProblem, type Analysis } from './lib/localSolver'
 import { configureAI, extractWithAI, isAIConfigured } from './lib/remoteAI'
 
 /* ---------- tiny inline icon set (no emoji, no deps) ---------- */
@@ -124,11 +124,28 @@ function App() {
   const [problem, setProblem] = useState('')
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [message, setMessage] = useState('')
+  const [clarify, setClarify] = useState<{
+    detected: string
+    understood: string[]
+    missing: string[]
+    fixExample: string
+    appendFix: string
+  } | null>(null)
   const [loading, setLoading] = useState(false)
   const [backend, setBackend] = useState<'checking' | 'online' | 'offline'>('checking')
   const [copied, setCopied] = useState(false)
   const [solvedVia, setSolvedVia] = useState<'api' | 'ai' | 'browser' | null>(null)
   const [aiNote, setAiNote] = useState<string | null>(null)
+
+  // Live trace: show what the solver understands as the user types.
+  const trace = useMemo(() => {
+    if (problem.trim().length < 10) return null
+    try {
+      return traceProblem(problem)
+    } catch {
+      return null
+    }
+  }, [problem])
 
   useEffect(() => {
     let cancelled = false
@@ -156,6 +173,7 @@ function App() {
 
     setLoading(true)
     setMessage('')
+    setClarify(null)
     setAnalysis(null)
     setSolvedVia(null)
     setAiNote(null)
@@ -206,15 +224,58 @@ function App() {
       setAnalysis(local)
       setSolvedVia('browser')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Could not solve this problem. Please try again.')
+      const err = error as Error & {
+        understood?: string[]
+        missing?: string[]
+        fixExample?: string
+        appendFix?: string
+        detected?: string
+      }
+      // Structured clarification (what we understood + exactly what's missing)
+      // renders as a helpful card, not a dead-end error.
+      if (err && (Array.isArray(err.understood) || Array.isArray(err.missing))) {
+        setClarify({
+          detected: String(err.detected ?? 'unknown'),
+          understood: err.understood ?? [],
+          missing: err.missing ?? [],
+          fixExample: err.fixExample ?? '',
+          appendFix: err.appendFix ?? '',
+        })
+        setMessage(err.message)
+      } else {
+        setMessage(error instanceof Error ? error.message : 'Could not solve this problem. Please try again.')
+      }
     } finally {
       setLoading(false)
     }
   }
 
+  function applyFix() {
+    if (!clarify) return
+    const fix = clarify.appendFix || (clarify.fixExample ? ' ' + clarify.fixExample : '')
+    if (!fix.trim()) return
+    const next = problem.trim().endsWith('.') ? `${problem.trim()} ${fix.trim()}` : `${problem.trim()}. ${fix.trim()}`
+    setProblem(next)
+    setClarify(null)
+    setMessage('')
+    // Re-solve automatically after a tick so the new text is in state.
+    setTimeout(() => {
+      document.getElementById('solve-btn')?.click()
+    }, 50)
+  }
+
+  function useFullExample() {
+    const ex = clarify?.fixExample || EXAMPLES[4].prompt
+    setProblem(ex)
+    setClarify(null)
+    setMessage('')
+    document.getElementById('solver')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }
+
   function useExample(prompt: string) {
     setProblem(prompt)
     setMessage('')
+    setClarify(null)
     document.getElementById('solver')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 
@@ -373,9 +434,22 @@ function App() {
           <textarea
             value={problem}
             onChange={(event) => setProblem(event.target.value)}
-            placeholder="Example in your own words: We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor."
+            placeholder="Just describe your problem in your own words — e.g. 'I run a bakery making bread and cakes with limited oven time…' or 'I ship from 2 warehouses to 3 stores…' — I'll work out the details."
             maxLength={10000}
           />
+
+          {trace && problem.trim().length >= 10 && !analysis && (
+            <div className="trace-hint" role="status">
+              <span className="trace-dot" aria-hidden />
+              <span>
+                {trace.missing.length === 0 ? (
+                  <>Looks ready — detected <strong>{trace.detected}</strong>{trace.understood.length > 0 ? ` (${trace.understood.join('; ')})` : ''}. Hit “Solve my plan”.</>
+                ) : (
+                  <>Detected <strong>{trace.detected}</strong>{trace.understood.length > 0 ? ` — got ${trace.understood.join('; ')}` : ''}. Still need: <strong>{trace.missing.join(' + ')}</strong>.</>
+                )}
+              </span>
+            </div>
+          )}
 
           <div className="examples">
             {EXAMPLES.map((ex) => (
@@ -394,7 +468,7 @@ function App() {
               {charCount.toLocaleString()} / 10,000 chars · No signup · Any wording works ·{' '}
               {isAIConfigured() ? 'AI assist on' : 'Offline solver ready'}
             </span>
-            <button className="btn btn-primary" onClick={handleSolve} disabled={loading} type="button">
+            <button className="btn btn-primary" id="solve-btn" onClick={handleSolve} disabled={loading} type="button">
               {loading ? (
                 <>
                   <span className="spinner" /> Analyzing…
@@ -408,10 +482,52 @@ function App() {
           </div>
         </section>
 
-        {message && (
+        {message && !clarify && (
           <p className="message error" role="alert">
             {message}
           </p>
+        )}
+
+        {clarify && (
+          <section className="clarify-card" aria-live="polite">
+            <p className="eyebrow">WHAT I UNDERSTOOD</p>
+            <p className="clarify-text">{message}</p>
+            <div className="clarify-grid">
+              {clarify.understood.length > 0 && (
+                <div>
+                  <strong>Got it</strong>
+                  <ul>
+                    {clarify.understood.map((u) => (
+                      <li key={u}>{u}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {clarify.missing.length > 0 && (
+                <div>
+                  <strong>Still need</strong>
+                  <ul>
+                    {clarify.missing.map((m) => (
+                      <li key={m}>{m}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+            <div className="clarify-actions">
+              {(clarify.appendFix || clarify.fixExample) && (
+                <button className="btn btn-primary btn-small" type="button" onClick={applyFix}>
+                  Add what's missing &amp; solve
+                </button>
+              )}
+              <button className="btn btn-ghost btn-small" type="button" onClick={useFullExample}>
+                Show me a working example
+              </button>
+            </div>
+            <small className="clarify-note">
+              Tip: just keep typing in your own words — any phrasing with the same numbers works. No fixed format needed.
+            </small>
+          </section>
         )}
 
         {aiNote && solvedVia === 'browser' && (

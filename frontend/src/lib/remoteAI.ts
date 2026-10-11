@@ -35,10 +35,12 @@ export function isAIConfigured(): boolean {
 }
 
 const PROMPT = `You are an operations-research model classifier and mathematical formulation assistant. Read the business problem and return JSON only.
-Users phrase problems freely in their own words — never require rigid templates like "Product A".
-Understand synonyms: profit = profit/margin/earn/yield/contribution/gain/revenue; needs = needs/uses/requires/consumes/takes; have = have/available/in stock/capacity/total/limited to.
+Users phrase problems freely in their own words — never require rigid templates like "Product A". They may write casually ("I run a bakery…", "I ship from…", "my factory has…").
+Understand synonyms: profit = profit/margin/earn/yield/contribution/gain/revenue/makes/gives/price; needs = needs/uses/requires/consumes/takes/spends; have = have/available/in stock/on hand/capacity/total/limited to/left.
 Product names can be anything (chairs, bread, phones, X1). Resource names can be anything (wood, machine hours, labour, oven).
-Normalize them into the model, keep every stated number exact, never invent missing numbers.
+Places can be anything (Warehouse A, Mumbai depot, Store X). Costs can appear as "A to X costs 4", "A->X 4", "$4 from A to X", "cost from A to X is 4", "shipping A-X: 4".
+Normalize names into the model, keep every stated number exact, never invent missing numbers.
+Trace the problem first: identify whether it is production (make things for profit with limited resources), transportation (ship from supplies to demands with route costs), or game theory (two players, payoffs).
 This site only solves optimization problems (production, transportation, game theory) — never general math.
 
 Choose model_type as production, transportation, or game_theory. Return this envelope:
