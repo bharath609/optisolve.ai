@@ -47,27 +47,36 @@ Commit and push the application to GitHub. Do not commit `backend/.env` or any A
    pinned: false
    ---
 
-   # OptiForge API
-   FastAPI backend for optiforge.ai (production / transportation / game-theory solver).
-   ```
+    # OptiSolve API
+    FastAPI backend for optisolve.ai (production / transportation / game-theory solver).
+    ```
 
 3. Upload the repository's root `Dockerfile`, `.dockerignore`, and the whole `backend` folder to the Space
    (via the web UI: Add file > Upload files, or `git clone` the Space and copy them in).
 4. Add this Space secret under Settings > Variables and secrets (Repository secrets):
-   - `FRONTEND_ORIGINS=https://optiforge-ai.vercel.app,https://optiforge.ai,https://www.optiforge.ai`
-   - Skip `EXPLABS_API_KEY` / `SIMPLE_AI_API_KEY` for now — production examples solve without keys.
+    - `FRONTEND_ORIGINS=https://optisolve.ai,https://www.optisolve.ai,https://optiforge-ai.vercel.app`
+    - Skip `EXPLABS_API_KEY` / `SIMPLE_AI_API_KEY` for now — production examples solve without keys.
 5. Wait for the Space to build, then confirm `https://<space-owner>-<space-name>.hf.space/` returns `{"message":"OptiForge backend is working"}`.
 6. Set Vercel's `VITE_API_URL` to that Hugging Face URL instead of a Render URL.
 
-## 4. Connect `optiforge.ai`
+## 4. Connect `optisolve.ai` (custom domain)
 
-In Vercel, add both `optiforge.ai` and `www.optiforge.ai` to the frontend project. Vercel will show the DNS records required at the domain registrar. Add those records, wait for DNS propagation, and make `optiforge.ai` the primary domain.
+`optisolve.ai` must be registered first (buy it at Porkbun, Cloudflare Registrar, or Namecheap —
+`.ai` domains cost roughly $70–140/yr). Then:
+
+1. In Vercel, open the frontend project → Settings → Domains → add `optisolve.ai` and `www.optisolve.ai`.
+2. Vercel will show the required DNS records. At your registrar add:
+    - `A` record for `@` → `76.76.21.21`
+    - `CNAME` record for `www` → `cname.vercel-dns.com`
+3. Wait for DNS propagation, then make `optisolve.ai` the primary domain and enable
+   "Redirect `optiforge-ai.vercel.app` to primary domain" (a code-level redirect is also
+   already configured in `vercel.json`, so the old address forwards automatically).
 
 The Render API can remain on its `onrender.com` hostname. The browser only needs the Vercel domain, and the API CORS configuration in `render.yaml` allows both apex and `www` domains.
 
 ## 5. Production checks
 
-- Open `https://optiforge.ai`.
+- Open `https://optisolve.ai`.
 - Submit a simple game or production prompt and verify a result.
 - Check the backend host logs for API errors.
 - Confirm both provider keys are configured as hosting secrets and not in Git.
