@@ -1,7 +1,0 @@
-fastapi
-httpx
-pyomo
-highspy
-python-dotenv
-uvicorn[standard]
-pytest
