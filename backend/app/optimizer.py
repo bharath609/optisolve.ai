@@ -1,6 +1,6 @@
 import pyomo.environ as pyo
 
-from .schemas import GameModel, PlanningModel, ProductResult, ResourceResult, ShipmentResult, StrategyResult, TransportationModel
+from .schemas import GameModel, PlanningModel, ProcurementModel, ProductResult, PurchaseResult, ResourceResult, ShipmentResult, StrategyResult, TransportationModel
 
 
 def solve_model(planning_model: PlanningModel) -> tuple[list[ProductResult], list[ResourceResult], float]:
@@ -114,3 +114,65 @@ def solve_game(game_model: GameModel) -> tuple[list[StrategyResult], float]:
         if pyo.value(model.probability[action]) > 0.0001
     ]
     return strategies, round(pyo.value(model.value), 4)
+
+
+def _procurement_lp(proc_model: ProcurementModel, extra_spend: tuple[str, float] | None = None) -> tuple[dict[tuple[str, str], float], float]:
+    """Minimum base cost (and quantities) to meet all requirements, optionally
+    forcing spend at one shop above its discount threshold."""
+    model = pyo.ConcreteModel()
+    pairs = [(shop, item) for shop in proc_model.shops for item in proc_model.items]
+    model.pairs = pyo.Set(initialize=pairs, dimen=2)
+    model.quantity = pyo.Var(model.pairs, domain=pyo.NonNegativeReals)
+    prices = proc_model.prices
+
+    model.demand = pyo.Constraint(proc_model.items, rule=lambda current, item: sum(current.quantity[shop, item] for shop in proc_model.shops) >= proc_model.requirements[item])
+    for shop in proc_model.shops:
+        for item in proc_model.items:
+            if item not in prices.get(shop, {}):
+                model.quantity[shop, item].fix(0)
+    if extra_spend is not None:
+        spend_shop, threshold = extra_spend
+        model.threshold = pyo.Constraint(
+            expr=sum(prices[spend_shop].get(item, 0) * model.quantity[spend_shop, item] for item in proc_model.items) >= threshold
+        )
+    model.cost = pyo.Objective(
+        expr=sum(prices[shop].get(item, 0) * model.quantity[shop, item] for shop, item in pairs),
+        sense=pyo.minimize,
+    )
+
+    solver = pyo.SolverFactory("appsi_highs")
+    if not solver.available(exception_flag=False):
+        raise RuntimeError("The HiGHS solver is not available in this environment.")
+    result = solver.solve(model)
+    if result.solver.termination_condition != pyo.TerminationCondition.optimal:
+        raise RuntimeError(f"Solver did not find an optimal purchase plan: {result.solver.termination_condition}")
+    quantities = {(shop, item): round(max(0, pyo.value(model.quantity[shop, item])), 4) for shop, item in pairs}
+    return quantities, round(pyo.value(model.cost), 2)
+
+
+def solve_procurement(proc_model: ProcurementModel) -> tuple[list[PurchaseResult], float, float]:
+    """Best purchase plan, comparing the plain cheapest plan against each
+    shop-threshold-discount scenario. Returns (purchases, total_cost, discount_applied)."""
+    quantities, base_cost = _procurement_lp(proc_model)
+    best_quantities, best_total, best_discount = quantities, base_cost, 0.0
+    for rule in proc_model.discounts:
+        if rule.shop not in proc_model.shops:
+            continue
+        try:
+            alt_quantities, alt_base = _procurement_lp(proc_model, (rule.shop, rule.threshold))
+        except RuntimeError:
+            continue
+        alt_total = round(alt_base - rule.amount, 2)
+        if alt_total < best_total - 1e-9:
+            best_quantities, best_total, best_discount = alt_quantities, alt_total, rule.amount
+    purchases = [
+        PurchaseResult(
+            shop=shop,
+            item=item,
+            quantity=quantity,
+            cost=round(proc_model.prices[shop][item] * quantity, 2),
+        )
+        for (shop, item), quantity in best_quantities.items()
+        if quantity > 0.0001 and item in proc_model.prices.get(shop, {})
+    ]
+    return purchases, best_total, best_discount

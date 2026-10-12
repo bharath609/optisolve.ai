@@ -6,7 +6,9 @@
    Nothing here runs unless a key is configured. */
 
 import {
+  detectCurrency,
   solveGameActions,
+  solveProcurement,
   solveProduction,
   solveTransportation,
   type Analysis,
@@ -41,13 +43,14 @@ Product names can be anything (chairs, bread, phones, X1). Resource names can be
 Places can be anything (Warehouse A, Mumbai depot, Store X). Costs can appear as "A to X costs 4", "A->X 4", "$4 from A to X", "cost from A to X is 4", "shipping A-X: 4".
 Normalize names into the model, keep every stated number exact, never invent missing numbers.
 Trace the problem first: identify whether it is production (make things for profit with limited resources), transportation (ship from supplies to demands with route costs), or game theory (two players, payoffs).
-This site only solves optimization problems (production, transportation, game theory) — never general math.
+This site only solves optimization problems (production, transportation, procurement/shopping, game theory) — never general math.
 
-Choose model_type as production, transportation, or game_theory. Return this envelope:
-{"model_type":"production|transportation|game_theory","problem_summary":string,"technique":string,"objective":string,"variables":[string],"constraints":[string],"assumptions":[string],"model":{...}}
+Choose model_type as production, transportation, procurement, or game_theory. Return this envelope:
+{"model_type":"production|transportation|procurement|game_theory","problem_summary":string,"technique":string,"objective":string,"variables":[string],"constraints":[string],"assumptions":[string],"model":{...}}
 
 For production, model must be {"products":[{"name":string,"profit":number,"resource_usage":{resource:number},"demand_limit":number|null}],"capacities":{resource:number}}.
 For transportation, model must be {"sources":[{"name":string,"supply":number}],"destinations":[{"name":string,"demand":number}],"costs":{"source":{"destination":number}}}.
+For procurement (groceries, diet, vendor choice: meet minimum needs cheapest across shops), model must be {"shops":[string],"items":[string],"requirements":{item:number},"prices":{"shop":{item:number}},"discounts":[{"shop":string,"amount":number,"threshold":number}]}. List items in the order the requirements appear; map "respectively" prices to that order; keep every price exact.
 For game_theory, model must be {"player_one_actions":[string],"player_two_actions":[string],"payoffs":{"player_one_action":{"player_two_action":number}},"zero_sum":true}. Use Player 1's payoff values and preserve negative payoffs.
 Use consistent names, preserve all stated numbers, and do not invent missing numbers. If the problem is general math or otherwise neither supported type, return a concise JSON error with {"error":"unsupported"}.
 
@@ -60,7 +63,7 @@ function stripCodeFence(content: string): string {
 }
 
 interface AIModel {
-  model_type: 'production' | 'transportation' | 'game_theory';
+  model_type: 'production' | 'transportation' | 'procurement' | 'game_theory';
   model: Record<string, unknown>;
   problem_summary?: string;
   technique?: string;
@@ -152,6 +155,7 @@ export async function extractWithAI(problem: string): Promise<Analysis> {
       variables: parsed.variables ?? [],
       constraints: parsed.constraints ?? [],
       assumptions: parsed.assumptions ?? [],
+      currency: detectCurrency(problem),
     };
     if (parsed.model_type === 'production') {
       const m = parsed.model as {
@@ -185,6 +189,49 @@ export async function extractWithAI(problem: string): Promise<Analysis> {
         ),
       });
       return { ...result, ...meta, model_type: 'transportation' };
+    }
+    if (parsed.model_type === 'procurement') {
+      const m = parsed.model as {
+        shops?: unknown[];
+        items?: unknown[];
+        requirements?: Record<string, unknown>;
+        prices?: Record<string, Record<string, unknown>>;
+        discounts?: { shop?: unknown; amount?: unknown; threshold?: unknown }[];
+      };
+      const shops = (m.shops ?? []).map(String);
+      const items = (m.items ?? []).map(String);
+      if (shops.length === 0 || items.length === 0 || !m.requirements || !m.prices) throw new Error('bad-model');
+      const requirements: Record<string, number> = {};
+      for (const it of items) {
+        const v = m.requirements[it];
+        if (v == null) throw new Error('bad-model');
+        requirements[it] = num(v);
+      }
+      const prices: Record<string, Record<string, number>> = {};
+      for (const sh of shops) {
+        const row = m.prices[sh];
+        if (!row) throw new Error('bad-model');
+        prices[sh] = {};
+        for (const it of items) {
+          const v = row[it];
+          if (v != null) prices[sh][it] = num(v);
+        }
+        if (Object.keys(prices[sh]).length === 0) throw new Error('bad-model');
+      }
+      for (const it of items) {
+        if (!shops.some((sh) => prices[sh][it] != null)) throw new Error('bad-model');
+      }
+      const result = solveProcurement(
+        {
+          shops,
+          items,
+          requirements,
+          prices,
+          discounts: (m.discounts ?? []).map((d) => ({ shop: String(d.shop), amount: num(d.amount), threshold: num(d.threshold) })),
+        },
+        detectCurrency(problem),
+      );
+      return { ...result, ...meta, model_type: 'procurement' as const };
     }
     if (parsed.model_type === 'game_theory') {
       const m = parsed.model as {

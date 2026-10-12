@@ -2,15 +2,16 @@
    (no API key) and solve them in-browser with the bundled simplex LP solver.
    Accepts any wording — product names, synonyms for profit/resources/capacity —
    then normalizes ("understands") it into a production / transportation /
-   game-theory model. Mirrors backend/app/ai.py fallback parsing. */
+   procurement / game-theory model. Mirrors backend/app/ai.py fallback parsing. */
 
 import { solveLP } from './simplex';
 
-export type ModelType = 'production' | 'transportation' | 'game_theory';
+export type ModelType = 'production' | 'transportation' | 'game_theory' | 'procurement';
 
 export interface ProductResult { name: string; quantity: number; profit: number }
 export interface ResourceResult { name: string; used: number; capacity: number; utilization: number }
 export interface ShipmentResult { source: string; destination: string; quantity: number; cost: number }
+export interface PurchaseLine { shop: string; item: string; quantity: number; cost: number }
 export interface StrategyResult { player: string; action: string; probability: number }
 
 export interface Analysis {
@@ -24,11 +25,24 @@ export interface Analysis {
   products: ProductResult[];
   resources: ResourceResult[];
   shipments: ShipmentResult[];
+  purchases: PurchaseLine[];
   strategies: StrategyResult[];
   game_value?: number;
   total_profit?: number;
   total_cost?: number;
+  discount_applied?: number;
+  currency: string;
   explanation: string;
+}
+
+/** Detect the currency used in the user's wording (default $). */
+export function detectCurrency(text: string): string {
+  if (/₹/.test(text)) return '₹';
+  if (/\bRs\.?/i.test(text)) return '₹';
+  if (/€/.test(text)) return '€';
+  if (/£/.test(text)) return '£';
+  if (/\$/.test(text)) return '$';
+  return '$';
 }
 
 /* ---------------- user-friendly clarification -------------------------------
@@ -37,7 +51,7 @@ export interface Analysis {
    Error so old catch-blocks keep working, but the UI can render a helpful
    understanding card with one-click fixes. */
 
-export type DetectedType = ModelType | 'production?' | 'transportation?' | 'game?' | 'unknown';
+export type DetectedType = ModelType | 'production?' | 'transportation?' | 'game?' | 'procurement?' | 'unknown';
 
 export class ClarificationError extends Error {
   detected: DetectedType;
@@ -514,8 +528,10 @@ export function solveProduction(products: ParsedProduct[], capacities: Record<st
     products: productResults,
     resources: resourceResults,
     shipments: [],
+    purchases: [],
     strategies: [],
     total_profit: totalProfit,
+    currency: '$',
     explanation,
   };
 }
@@ -935,7 +951,29 @@ export function traceProblem(text: string): { detected: DetectedType; understood
     return { detected: 'production?', understood, missing };
   }
   if (GAME_WORDS.test(text)) return { detected: 'game?', understood: ['competitive / game-theory wording'], missing: ['two choices + four payoffs for Player 1'] };
-  return { detected: 'unknown', understood: [], missing: ['what you make or ship, your limits, and your numbers'] };
+  const procTr = parseProcurement(text);
+  if (procTr) {
+    return {
+      detected: 'procurement',
+      understood: [
+        `needs: ${procTr.items.map((it) => `${it} (${procTr.requirements[it]})`).join(', ')}`,
+        `shops: ${procTr.shops.join(', ')}`,
+      ],
+      missing: [],
+    };
+  }
+  if (/shop|store|vendor|sells?|purchase|buys?|prices?|discount|grocery|mart/i.test(text) && !hasProfitWords) {
+    const pt = procurementTrace(text);
+    const understood: string[] = [];
+    const missing: string[] = [];
+    if (pt.shops.length > 0) understood.push(`shops: ${pt.shops.join(', ')}`);
+    else missing.push('where you can buy');
+    if (pt.items.length > 0) understood.push(`needs: ${pt.items.join(', ')}`);
+    else missing.push('how much you need');
+    if (pt.shops.length > 0 && pt.items.length > 0) missing.push('price at each shop');
+    return { detected: 'procurement?', understood, missing };
+  }
+  return { detected: 'unknown', understood: [], missing: ['what you make, ship, or buy, your limits, and your numbers'] };
 }
 
 export function solveTransportation(data: TransportData): Analysis {
@@ -994,9 +1032,356 @@ export function solveTransportation(data: TransportData): Analysis {
     products: [],
     resources: [],
     shipments,
+    purchases: [],
     strategies: [],
     total_cost: totalCost,
+    currency: '$',
     explanation: `Understood as shipping from ${sources.map((s) => s.name).join(', ')} to ${destinations.map((d) => d.name).join(', ')}. The lowest-cost transportation plan has a total shipping cost of $${totalCost.toLocaleString(undefined, { minimumFractionDigits: 2 })}.`,
+  };
+}
+
+/* ---------------- procurement parsing + solving -----------------------------
+   Minimum-cost purchase plans: meet required quantities of items by buying
+   from shops with different unit prices (groceries, diet/blending homework,
+   vendor selection). Per-shop threshold discounts ("₹100 off over ₹500")
+   are handled by comparing discounted vs plain scenarios. */
+
+export interface ProcurementData {
+  shops: string[];
+  items: string[];
+  requirements: Record<string, number>;
+  prices: Record<string, Record<string, number>>;
+  discounts: { shop: string; amount: number; threshold: number }[];
+}
+
+const SHOP_WORD = '(?:shop|store|vendor|supplier|mart|market|mall|outlet|dealer)';
+const SHOP_NAME_RE = '(shop|store|vendor|supplier|mart|market|mall|outlet|dealer)\\s+([A-Za-z0-9]+)';
+const QTY_UNIT = '(?:kg|kgs|kilos?|grams?|gms?|g|liters?|litres?|ltrs?|l|ml|units?|packs?|packets?|bottles?|cans?|pieces?|dozens?|bags?)';
+const MONEY = '(?:₹|Rs\\.?|\\$|€|£)';
+
+function cleanItemName(raw: string): string {
+  let s = cleanNodeName(raw);
+  s = s.replace(/\s+(per\s+(?:month|day|week|year)|each\s+(?:month|day)|monthly|daily)$/i, '').trim();
+  s = s.replace(/\s+from\s+(?:shop|store|vendor|supplier|mart|market|mall|outlet|dealer)\s+[A-Za-z0-9]+$/i, '').trim();
+  s = s.replace(/^(at\s+least|atleast|minimum\s+of|minimum|min)\s+/i, '').trim();
+  return s;
+}
+
+function shopNameInSentence(sentence: string, shops: string[]): string | null {
+  // nearest shop mention in this sentence (first), matched against known shops
+  const re = new RegExp(SHOP_NAME_RE, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sentence)) !== null) {
+    const cand = cleanNodeName(`${m[1]} ${m[2]}`);
+    const hit = shops.find((s) => canonHit(s, cand));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** Shop mentions in a sentence with their positions (for nearest-shop lookup). */
+function shopMentions(sentence: string, shops: string[]): { index: number; shop: string }[] {
+  const out: { index: number; shop: string }[] = [];
+  const re = new RegExp(SHOP_NAME_RE, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sentence)) !== null) {
+    const cand = cleanNodeName(`${m[1]} ${m[2]}`);
+    const hit = shops.find((s) => canonHit(s, cand));
+    if (hit) out.push({ index: m.index, shop: hit });
+  }
+  return out;
+}
+
+export function parseProcurement(text: string): ProcurementData | null {
+  // quick gate: needs shop/vendor + price/discount wording
+  if (!new RegExp(`${SHOP_WORD}|sells?|purchase|buys?|prices?|discount|grocery`, 'i').test(text)) return null;
+  // never hijack production problems (they talk profit, not prices)
+  if (/profit|margin|contribution/i.test(text)) return null;
+
+  // 1) shops
+  const shops: string[] = [];
+  const shopSeen = new Set<string>();
+  {
+    const re = new RegExp(SHOP_NAME_RE, 'gi');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const name = cleanNodeName(`${m[1]} ${m[2]}`);
+      const key = canonKey(name);
+      if (!name || shopSeen.has(key)) continue;
+      shopSeen.add(key);
+      shops.push(name);
+    }
+  }
+  if (shops.length === 0) return null;
+
+  const sentences = text.split(/[.\n;]+/);
+  // 2) requirements (minimum quantities), in order
+  const items: string[] = [];
+  const requirements: Record<string, number> = {};
+  const itemSeen = new Set<string>();
+  const addReq = (rawItem: string, qty: number) => {
+    const item = cleanItemName(rawItem);
+    if (!item || item.length > 40) return;
+    if (/^(demand|supply|profit|margin|discount|purchase\s+value|total)$/i.test(item)) return;
+    if (/demand|supply|profit|discount/i.test(item)) return;
+    const key = canonKey(item);
+    if (!key || itemSeen.has(key)) return;
+    itemSeen.add(key);
+    items.push(item);
+    requirements[item] = qty;
+  };
+  const reqLook = `(?=\\s*(?:and|,|;|\\.|per\\s+(?:month|day|week)|each\\s+(?:month|day)|$))`;
+  for (const raw of sentences) {
+    const s = raw.trim();
+    if (!s) continue;
+    let m: RegExpExecArray | null;
+    // "needs at least 10 kg of rice" / "requires 5 liters of oil"
+    const r1 = new RegExp(
+      `(?:needs?|requires?|must\\s+(?:buy|get|have)|should\\s+(?:buy|get))\\s+(?:at\\s+least\\s+|atleast\\s+|a\\s+minimum\\s+of\\s+|minimum\\s+of\\s+|minimum\\s+|min\\s+)?(\\d+(?:\\.\\d+)?)\\s*${QTY_UNIT}?\\s*(?:of\\s+)?([A-Za-z][A-Za-z][\\w\\- ]*?)${reqLook}`,
+      'gi',
+    );
+    while ((m = r1.exec(s)) !== null) {
+      if (new RegExp(`${MONEY}`).test(m[0])) continue;
+      addReq(m[2], parseFloat(m[1]));
+    }
+    // "at least 10 kg of rice"
+    const r2 = new RegExp(`at\\s+least\\s+(\\d+(?:\\.\\d+)?)\\s*${QTY_UNIT}?\\s*(?:of\\s+)?([A-Za-z][A-Za-z][\\w\\- ]*?)${reqLook}`, 'gi');
+    while ((m = r2.exec(s)) !== null) {
+      if (new RegExp(`${MONEY}`).test(m[0])) continue;
+      addReq(m[2], parseFloat(m[1]));
+    }
+    // bare list members after an intro: "10 kg of rice, 5 liters of oil, and 4 kg of pulses"
+    if (/needs?|requires?|at\s+least|minimum/i.test(s) && Object.keys(requirements).length > 0) {
+      const r3 = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*${QTY_UNIT}\\s*(?:of\\s+)?([A-Za-z][A-Za-z][\\w\\- ]*?)${reqLook}`, 'gi');
+      while ((m = r3.exec(s)) !== null) {
+        if (new RegExp(`${MONEY}`).test(m[0])) continue;
+        addReq(m[2], parseFloat(m[1]));
+      }
+    }
+  }
+  if (items.length === 0) return null;
+
+  // 3) prices per shop — each price uses its NEAREST preceding shop mention,
+  // so "Shop A sells rice at ₹50, Shop B at ₹45" splits correctly.
+  const prices: Record<string, Record<string, number>> = {};
+  let lastShop: string | null = null;
+  for (const raw of sentences) {
+    const s = raw.trim();
+    if (!s) continue;
+    const mentions = shopMentions(s, shops);
+    const mentioned = mentions.length > 0 ? mentions[0].shop : null;
+    if (mentioned) lastShop = mentioned;
+    // "the same items at ₹45/kg, ₹130/liter, and ₹90/kg, respectively"
+    if (/respectively/i.test(s) && mentioned) {
+      const nums = [...s.matchAll(new RegExp(`(?:${MONEY})?\\s*(\\d+(?:\\.\\d+)?)`, 'gi'))].map((x) => parseFloat(x[1]));
+      if (nums.length === items.length) {
+        prices[mentioned] = prices[mentioned] ?? {};
+        items.forEach((it, i) => {
+          prices[mentioned][it] = nums[i];
+        });
+        lastShop = mentioned;
+        continue;
+      }
+    }
+    // "rice at ₹50/kg" (currency or /unit required so "look at 10" never matches)
+    const pr = new RegExp(
+      `([A-Za-z][A-Za-z][\\w\\- ]*?)\\s+at\\s+(${MONEY})?\\s*(\\d+(?:\\.\\d+)?)\\s*(\\/\\s*\\w+)?`,
+      'gi',
+    );
+    let m: RegExpExecArray | null;
+    let lastItem: string | null = null;
+    while ((m = pr.exec(s)) !== null) {
+      if (!m[2] && !m[4]) continue;
+      const cand = cleanItemName(m[1]);
+      // shop restated inside the price ("Shop B at ₹45")? it owns this price
+      const candShop = shopNameInSentence(m[1], shops);
+      // nearest shop mentioned before this price (else sentence/fallback shop)
+      let shop: string | null = candShop;
+      if (!shop) {
+        for (const men of mentions) {
+          if (men.index < m.index) shop = men.shop;
+          else break;
+        }
+        shop = shop ?? mentioned ?? lastShop;
+      }
+      if (!shop) continue;
+      let hit = items.find((it) => canonHit(it, cand));
+      if (!hit) {
+        // "Shop B at ₹45" — shop restated without the item: same item as before
+        if (candShop && lastItem) hit = lastItem;
+        else continue;
+      }
+      lastItem = hit;
+      prices[shop] = prices[shop] ?? {};
+      if (!(hit in prices[shop])) prices[shop][hit] = parseFloat(m[3]);
+    }
+    if (mentions.length > 0) lastShop = mentions[mentions.length - 1].shop;
+  }
+  // every required item needs at least one price; drop shops with no prices
+  const pricedShops = shops.filter((sh) => prices[sh] && Object.keys(prices[sh]).length > 0);
+  if (pricedShops.length === 0) return null;
+  for (const it of items) {
+    if (!pricedShops.some((sh) => prices[sh][it] != null)) return null;
+  }
+
+  // 4) threshold discounts: "Shop A offers a ₹100 discount ... at least ₹500"
+  const discounts: { shop: string; amount: number; threshold: number }[] = [];
+  {
+    const re = new RegExp(
+      `${SHOP_NAME_RE}\\s*[^.\\n;]*?(\\d+(?:\\.\\d+)?)\\s*discount[^.\\n;]*?(?:at\\s+least|over|above|minimum\\s+(?:of\\s+)?|more\\s+than|exceeding|reaches|reaching)\\s*(?:${MONEY})?\\s*(\\d+(?:\\.\\d+)?)`,
+      'gi',
+    );
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const cand = cleanNodeName(`${m[1]} ${m[2]}`);
+      const hit = pricedShops.find((s) => canonHit(s, cand)) ?? pricedShops[0];
+      const amount = parseFloat(m[3]);
+      const threshold = parseFloat(m[4]);
+      if (Number.isFinite(amount) && Number.isFinite(threshold) && amount > 0 && threshold > 0) {
+        if (!discounts.some((d) => d.shop === hit)) discounts.push({ shop: hit, amount, threshold });
+      }
+    }
+  }
+  return { shops: pricedShops, items, requirements, prices, discounts };
+}
+
+/** Light trace (shops/items found) for friendly clarification messages. */
+export function procurementTrace(text: string): { shops: string[]; items: string[] } {
+  const shops: string[] = [];
+  const seen = new Set<string>();
+  const re = new RegExp(SHOP_NAME_RE, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const name = cleanNodeName(`${m[1]} ${m[2]}`);
+    const key = canonKey(name);
+    if (name && !seen.has(key)) {
+      seen.add(key);
+      shops.push(name);
+    }
+  }
+  const items: string[] = [];
+  const seenI = new Set<string>();
+  const addTraceItem = (raw: string, qty: string) => {
+    const item = cleanItemName(raw);
+    const key = canonKey(item);
+    if (item && !seenI.has(key) && item.length <= 40 && !/demand|supply|profit|discount/i.test(item)) {
+      seenI.add(key);
+      items.push(`${item} (${qty})`);
+    }
+  };
+  const look = `(?=\\s*(?:and|,|;|\\.|per\\s+(?:month|day)|$))`;
+  const r = new RegExp(`(?:at\\s+least\\s+|needs?\\s+(?:at\\s+least\\s+)?)(\\d+(?:\\.\\d+)?)\\s*${QTY_UNIT}?\\s*(?:of\\s+)?([A-Za-z][A-Za-z][\\w\\- ]*?)${look}`, 'gi');
+  while ((m = r.exec(text)) !== null) {
+    if (new RegExp(`${MONEY}`).test(m[0])) continue;
+    addTraceItem(m[2], m[1]);
+  }
+  // bare list members: "10 kg of rice, 5 liters of oil, and 4 kg of pulses"
+  if (/needs?|requires?|at\s+least|minimum/i.test(text) && items.length > 0) {
+    const r3 = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*${QTY_UNIT}\\s*(?:of\\s+)?([A-Za-z][A-Za-z][\\w\\- ]*?)${look}`, 'gi');
+    while ((m = r3.exec(text)) !== null) {
+      if (new RegExp(`${MONEY}`).test(m[0])) continue;
+      addTraceItem(m[2], m[1]);
+    }
+  }
+  return { shops, items };
+}
+
+export function solveProcurement(data: ProcurementData, currency: string): Analysis {
+  const { shops, items, requirements, prices, discounts } = data;
+  const nS = shops.length;
+  const nI = items.length;
+  const idx = (s: number, i: number) => s * nI + i;
+  const priceOf = (s: number, i: number): number | null => prices[shops[s]]?.[items[i]] ?? null;
+  const MISSING = 1e9;
+  const c: number[] = [];
+  for (let s = 0; s < nS; s++) for (let i = 0; i < nI; i++) c.push(-(priceOf(s, i) ?? MISSING));
+  const baseConstraints: { coeffs: number[]; rhs: number; sense: '<=' | '>=' | '=' }[] = [];
+  items.forEach((_it, i) => {
+    const coeffs = new Array(nS * nI).fill(0);
+    for (let s = 0; s < nS; s++) coeffs[idx(s, i)] = 1;
+    baseConstraints.push({ coeffs, rhs: requirements[items[i]], sense: '>=' });
+  });
+  // vendor doesn't sell this item -> force zero (instead of an absurd price)
+  for (let s = 0; s < nS; s++) {
+    for (let i = 0; i < nI; i++) {
+      if (priceOf(s, i) == null) {
+        const coeffs = new Array(nS * nI).fill(0);
+        coeffs[idx(s, i)] = 1;
+        baseConstraints.push({ coeffs, rhs: 0, sense: '=' });
+      }
+    }
+  }
+  const runLP = (extra?: { coeffs: number[]; rhs: number; sense: '<=' | '>=' | '=' }) => {
+    const cons = extra ? [...baseConstraints, extra] : baseConstraints;
+    const lp = solveLP(c, cons);
+    if (lp.status !== 'optimal') throw new Error('The solver could not find an optimal purchase plan for these numbers.');
+    return { solution: lp.solution, baseCost: -lp.objective };
+  };
+  const base = runLP();
+  let best = { solution: base.solution, total: base.baseCost, discount: 0, shop: null as string | null };
+  for (const d of discounts) {
+    const sIdx = shops.indexOf(d.shop);
+    if (sIdx < 0) continue;
+    const coeffs = new Array(nS * nI).fill(0);
+    for (let i = 0; i < nI; i++) coeffs[idx(sIdx, i)] = priceOf(sIdx, i) ?? 0;
+    try {
+      const r = runLP({ coeffs, rhs: d.threshold, sense: '>=' });
+      const total = r.baseCost - d.amount;
+      if (total < best.total - 1e-9) best = { solution: r.solution, total, discount: d.amount, shop: d.shop };
+    } catch {
+      // threshold unreachable — keep the plain plan
+    }
+  }
+  const lines: PurchaseLine[] = [];
+  for (let s = 0; s < nS; s++) {
+    for (let i = 0; i < nI; i++) {
+      const q = Math.max(0, best.solution[idx(s, i)]);
+      if (q > 0.0001 && priceOf(s, i) != null) {
+        lines.push({
+          shop: shops[s],
+          item: items[i],
+          quantity: round4(q),
+          cost: round2((priceOf(s, i) as number) * q),
+        });
+      }
+    }
+  }
+  const totalCost = round2(best.total);
+  const money = (v: number) => `${currency}${v.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+  const perItem = items.map((it) => {
+    const got = lines.filter((l) => l.item === it);
+    return `${got.map((g) => `${g.quantity} ${it} from ${g.shop}`).join(' + ')}`;
+  });
+  const explanation =
+    `Buy ${perItem.join('; ')}. ` +
+    (best.discount > 0 && best.shop
+      ? `This reaches the ${best.shop} discount threshold, so ${money(best.discount)} comes off. Cheapest possible monthly total: ${money(totalCost)}.`
+      : `Cheapest possible monthly total: ${money(totalCost)}.`);
+  return {
+    model_type: 'procurement',
+    problem_summary: 'Choose where to buy each item to meet all requirements at the lowest total cost.',
+    technique: 'Linear programming (minimum-cost purchase plan)',
+    objective: 'Minimize total purchase cost',
+    variables: shops.flatMap((s) => items.map((it) => `quantity of ${it} from ${s}`)),
+    constraints: [
+      ...items.map((it) => `buy at least ${requirements[it]} ${it}`),
+      ...discounts.map((d) => `${d.shop} gives ${money(d.amount)} off when spending reaches ${money(d.threshold)} there`),
+    ],
+    assumptions: [
+      'Understood your wording automatically; unit prices are fixed and quantities may be fractional.',
+      ...(best.discount > 0 && best.shop
+        ? [`The ${best.shop} threshold discount was compared against the plain cheapest plan and applied only because it wins.`]
+        : []),
+    ],
+    products: [],
+    resources: [],
+    shipments: [],
+    purchases: lines,
+    strategies: [],
+    total_cost: totalCost,
+    discount_applied: best.discount,
+    currency,
+    explanation,
   };
 }
 
@@ -1039,8 +1424,10 @@ export function solveGameActions(
     products: [],
     resources: [],
     shipments: [],
+    purchases: [],
     strategies,
     game_value: gameValue,
+    currency: '$',
     explanation: `The optimal mixed strategy guarantees an expected payoff of ${fmtG(gameValue)} for Player 1.`,
   };
 }
@@ -1132,15 +1519,20 @@ function looksLikeGeneralMath(text: string): boolean {
 export function solveLocally(problem: string): Analysis {
   const text = problem.trim();
   if (text.length < 10) throw new Error('Please describe your optimization problem in your own words — for example what you make, what limits you, or where you ship.');
+  const cur = detectCurrency(text);
+  const withCur = (a: Analysis): Analysis => {
+    a.currency = cur;
+    return a;
+  };
 
   if (looksLikeGeneralMath(text)) {
     throw new Error(
-      'OptiSolve only solves optimization problems — production planning, transportation, and game theory — not general math like equations or calculus. Describe profits with limited resources, shipping supplies/demands/costs, or a game payoff, in any wording.',
+      'OptiSolve only solves optimization problems — production planning, transportation, shopping/purchase planning, and game theory — not general math like equations or calculus. Describe profits with limited resources, shipping supplies/demands/costs, shopping needs with shop prices, or a game payoff, in any wording.',
     );
   }
 
   const game = parseGame(text);
-  if (game) return game;
+  if (game) return withCur(game);
 
   // Production-first: profit wording without shipping nouns is never transport
   // (stops "Demand for A at most 40" / "We have 100 units" misfiring as shipping).
@@ -1148,12 +1540,12 @@ export function solveLocally(problem: string): Analysis {
   const hasShipNouns = /warehouse|factory|plant|supplier|depot|store|shop|ship|freight|transport|deliver|customer|retailer/i.test(text);
   if (hasProfitWords && !hasShipNouns) {
     const prodOnly = parseProduction(text);
-    if (prodOnly) return solveProduction(prodOnly.products, prodOnly.capacities);
+    if (prodOnly) return withCur(solveProduction(prodOnly.products, prodOnly.capacities));
     // fall through to the friendly production clarification below
   } else {
     const transportWords = isTransportLike(text);
     const t = parseTransportation(text);
-    if (t) return solveTransportation(t);
+    if (t) return withCur(solveTransportation(t));
     if (transportWords) {
     // Shipping intent detected but something is missing — trace exactly what,
     // so the UI can show understanding + one-line fix instead of a dead end.
@@ -1216,8 +1608,34 @@ export function solveLocally(problem: string): Analysis {
     }
   }
 
+  // Minimum-cost purchase / diet / grocery problems: solve directly, never
+  // re-label them as something else.
+  const proc = parseProcurement(text);
+  if (proc) return withCur(solveProcurement(proc, cur));
+  if (/shop|store|vendor|sells?|purchase|buys?|prices?|discount|grocery|mart/i.test(text) && !hasProfitWords) {
+    const pt = procurementTrace(text);
+    const understood: string[] = [];
+    if (pt.shops.length > 0) understood.push(`shops: ${pt.shops.join(', ')}`);
+    if (pt.items.length > 0) understood.push(`needs: ${pt.items.join(', ')}`);
+    const missing: string[] = [];
+    if (pt.shops.length === 0) missing.push('where you can buy (e.g. "Shop A", "Shop B")');
+    if (pt.items.length === 0) missing.push('how much you need (e.g. "needs at least 10 kg of rice")');
+    if (pt.shops.length > 0 && pt.items.length > 0) missing.push('price at each shop (e.g. "Shop A sells rice at ₹50/kg")');
+    throw new ClarificationError({
+      message:
+        `Got it — this is a shopping / purchase problem${understood.length > 0 ? ` (${understood.join('; ')})` : ''}. ` +
+        `To find your cheapest plan I still need ${missing.join(' + ')} — in any wording you like. ` +
+        `Example: "We need at least 10 kg of rice. Shop A sells rice at ₹50/kg, Shop B at ₹45/kg."`,
+      detected: 'procurement?',
+      understood,
+      missing,
+      fixExample: 'We need at least 10 kg of rice and 5 liters of oil. Shop A sells rice at ₹50/kg and oil at ₹120/liter. Shop B sells rice at ₹45/kg and oil at ₹130/liter.',
+      appendFix: '',
+    });
+  }
+
   const prod = parseProduction(text);
-  if (prod) return solveProduction(prod.products, prod.capacities);
+  if (prod) return withCur(solveProduction(prod.products, prod.capacities));
   // Production intent but incomplete — say exactly which piece is missing,
   // using the user's own product/resource names when we have them.
   if (/profit|margin|earn|contribution|gain|revenue|makes?|produces?|manufactures?|capacity|available|machine|labo?r|wood|oven|material|assembl/i.test(text)) {
@@ -1268,10 +1686,10 @@ export function solveLocally(problem: string): Analysis {
   throw new ClarificationError({
     message:
       'Tell me about your problem in your own words and I\'ll work out the rest — for example: "We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor." ' +
-      'Or shipping: "Warehouse A has 100, Store X needs 120, A to X costs 4." I handle production, transportation, and game-theory problems (not general math).',
+      'Or shipping: "Warehouse A has 100, Store X needs 120, A to X costs 4." Or shopping: "We need 10 kg rice. Shop A sells rice at ₹50/kg, Shop B at ₹45/kg." I handle production, transportation, shopping/purchase, and game-theory problems (not general math).',
     detected: 'unknown',
     understood: [],
-    missing: ['what you make or ship, your limits, and your numbers'],
+    missing: ['what you make, ship, or buy, your limits, and your numbers'],
     fixExample: 'We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor.',
     appendFix: '',
   });

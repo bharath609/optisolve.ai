@@ -16,6 +16,7 @@ const LogoIcon = () => <I fill size={19} d="M12 2l2.7 7.3L22 12l-7.3 2.7L12 22l-
 const FactoryIcon = () => <I d="M3 21V10l5 3v-3l5 3V7h4v14zM7 17h2v2H7zm5 0h2v2h-2zm5 0h2v2h-2z" />
 const TruckIcon = () => <I d="M2 6h12v10H2zM14 10h4l4 4v2h-8zM6 19a1.6 1.6 0 100-3.2A1.6 1.6 0 006 19zm12 0a1.6 1.6 0 100-3.2A1.6 1.6 0 0018 19z" />
 const GameIcon = () => <I d="M6 12h4m-2-2v4m7-3h.01M18 13h.01M17.3 5H6.7a4 4 0 00-4 3.6L2 14a2.5 2.5 0 004.4 1.6L8 14h8l1.6 1.6A2.5 2.5 0 0022 14l-.7-5.4a4 4 0 00-4-3.6z" />
+const CartIcon = () => <I d="M3 4h2l2.4 12.2a1.5 1.5 0 001.5 1.3h8.9a1.5 1.5 0 001.5-1.2L21 8H6m9 12a1.4 1.4 0 100-2.8A1.4 1.4 0 0015 20zm-7 0a1.4 1.4 0 100-2.8A1.4 1.4 0 008 20z" />
 const PenIcon = () => <I d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z" />
 const ZapIcon = () => <I d="M13 2L4 14h6l-1 8 9-12h-6z" />
 const CheckIcon = () => <I d="M20 6L9 17l-5-5" />
@@ -111,12 +112,20 @@ const EXAMPLES = [
     prompt:
       'We make chairs and tables. Each chair earns 40 profit and takes 2 wood and 1 labor. Each table earns 30 profit and takes 1 wood and 2 labor. We have 100 wood and 80 labor available. Max 40 chairs can be sold.',
   },
+  {
+    label: 'Grocery shopping',
+    tag: 'Purchase plan · any wording',
+    icon: 'cart' as const,
+    prompt:
+      'A family needs at least 10 kg of rice, 5 liters of cooking oil, and 4 kg of pulses per month. Shop A sells rice at ₹50/kg, cooking oil at ₹120/liter, and pulses at ₹100/kg. Shop B sells the same items at ₹45/kg, ₹130/liter, and ₹90/kg, respectively. Shop A offers a ₹100 discount on the total purchase if the purchase value is at least ₹500. How should the family distribute its purchases between the two shops to minimize total cost?',
+  },
 ]
 
-function ExampleIcon({ kind }: { kind: 'factory' | 'truck' | 'pen' | 'game' }) {
+function ExampleIcon({ kind }: { kind: 'factory' | 'truck' | 'pen' | 'game' | 'cart' }) {
   if (kind === 'truck') return <TruckIcon />
   if (kind === 'pen') return <PenIcon />
   if (kind === 'game') return <GameIcon />
+  if (kind === 'cart') return <CartIcon />
   return <FactoryIcon />
 }
 
@@ -163,7 +172,7 @@ function App() {
 
   async function handleSolve() {
     if (!problem.trim()) {
-      setMessage('Describe your optimization problem in your own words first — what you make or ship, your limits, and costs — or try one of the examples below. Note: this solver handles production, transportation, and game-theory optimization only, not general math.')
+      setMessage('Describe your optimization problem in your own words first — what you make, ship, or buy, your limits, and costs — or try one of the examples below. Note: this solver handles production, transportation, shopping/purchase, and game-theory optimization only, not general math.')
       return
     }
     if (problem.trim().length < 10) {
@@ -281,14 +290,16 @@ function App() {
 
   function copyPlan() {
     if (!analysis) return
+    const cur = analysis.currency ?? '$'
     const lines = [
       analysis.problem_summary,
       '',
       analysis.explanation,
       '',
-      ...analysis.products.map((p) => `${p.name}: ${p.quantity} units ($${p.profit})`),
+      ...analysis.products.map((p) => `${p.name}: ${p.quantity} units (${cur}${p.profit})`),
       ...analysis.resources.map((r) => `${r.name}: ${r.used}/${r.capacity} (${Math.round(r.utilization * 100)}%)`),
-      ...analysis.shipments.map((s) => `${s.source} -> ${s.destination}: ${s.quantity} units ($${s.cost})`),
+      ...analysis.shipments.map((s) => `${s.source} -> ${s.destination}: ${s.quantity} units (${cur}${s.cost})`),
+      ...analysis.purchases.map((s) => `${s.shop} -> ${s.item}: ${s.quantity} units (${cur}${s.cost})`),
       ...analysis.strategies.map((s) => `${s.action}: ${Math.round(s.probability * 100)}%`),
     ]
     navigator.clipboard?.writeText(lines.join('\n')).then(
@@ -349,7 +360,7 @@ function App() {
             </h1>
             <p className="hero-text">
               Describe your business problem in <strong>plain English — any wording works</strong>. OptiSolve identifies the right model —
-              production, transportation, or game theory — and returns a <strong>mathematically optimal plan</strong> in seconds.
+              production, transportation, shopping, or game theory — and returns a <strong>mathematically optimal plan</strong> in seconds.
             </p>
             <div className="hero-actions">
               <a className="btn btn-primary" href="#solver">
@@ -361,7 +372,7 @@ function App() {
             </div>
             <div className="hero-stats">
               <div>
-                <strong>3</strong>
+                <strong>4</strong>
                 <span>model types supported</span>
               </div>
               <div>
@@ -426,7 +437,7 @@ function App() {
           <div className="prompt-heading">
             <div>
               <h2>What would you like to optimize?</h2>
-              <p>Use your own words — no fixed format needed. Production, transportation, or game-theory optimization only (not general math).</p>
+              <p>Use your own words — no fixed format needed. Production, transportation, shopping/purchase, or game-theory optimization only (not general math).</p>
             </div>
             <span className="badge">AI model selection + HiGHS solver</span>
           </div>
@@ -627,7 +638,7 @@ function App() {
                   <div className="profit">
                     <span>Total shipping cost</span>
                     <strong>
-                      <CountUp value={analysis.total_cost ?? 0} decimals={2} prefix="$" />
+                      <CountUp value={analysis.total_cost ?? 0} decimals={2} prefix={analysis.currency ?? '$'} />
                     </strong>
                   </div>
                 </div>
@@ -640,11 +651,50 @@ function App() {
                         {shipment.source} → {shipment.destination}
                       </span>
                       <strong>
-                        {shipment.quantity} units · $
+                        {shipment.quantity} units · {analysis.currency ?? '$'}
                         {shipment.cost.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                       </strong>
                     </div>
                   ))}
+                </div>
+              </>
+            ) : analysis.model_type === 'procurement' ? (
+              <>
+                <div className="result-header">
+                  <div>
+                    <p className="eyebrow">PURCHASE PLAN</p>
+                    <h2>Where to buy</h2>
+                  </div>
+                  <div className="profit">
+                    <span>Total cost{(analysis.discount_applied ?? 0) > 0 ? ' · discount applied' : ''}</span>
+                    <strong>
+                      <CountUp value={analysis.total_cost ?? 0} decimals={2} prefix={analysis.currency ?? '$'} />
+                    </strong>
+                  </div>
+                </div>
+                <p className="explanation">{analysis.explanation}</p>
+                <div className="result-panel">
+                  <h3>Buy this way</h3>
+                  {analysis.purchases.map((purchase) => (
+                    <div className="metric-row" key={`${purchase.shop}-${purchase.item}`}>
+                      <span>
+                        {purchase.shop} → {purchase.item}
+                      </span>
+                      <strong>
+                        {purchase.quantity} units · {analysis.currency ?? '$'}
+                        {purchase.cost.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      </strong>
+                    </div>
+                  ))}
+                  {(analysis.discount_applied ?? 0) > 0 && (
+                    <div className="metric-row">
+                      <span>Discount applied</span>
+                      <strong className="hl">
+                        −{analysis.currency ?? '$'}
+                        {(analysis.discount_applied ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      </strong>
+                    </div>
+                  )}
                 </div>
               </>
             ) : (
@@ -657,7 +707,7 @@ function App() {
                   <div className="profit">
                     <span>Total profit</span>
                     <strong>
-                      <CountUp value={analysis.total_profit ?? 0} decimals={2} prefix="$" />
+                      <CountUp value={analysis.total_profit ?? 0} decimals={2} prefix={analysis.currency ?? '$'} />
                     </strong>
                   </div>
                 </div>
@@ -718,7 +768,7 @@ function App() {
 
         <section className="use-cases reveal" id="use-cases">
           <p className="eyebrow">WHERE IT HELPS</p>
-          <h2>One input box, three powerful solvers.</h2>
+          <h2>One input box, four powerful solvers.</h2>
           <div className="use-grid">
             <div>
               <span className="use-ico"><FactoryIcon /></span>
@@ -731,14 +781,19 @@ function App() {
               <p>Minimize shipping cost across warehouses, stores, supplies, and demands.</p>
             </div>
             <div>
+              <span className="use-ico"><CartIcon /></span>
+              <h3>Shopping &amp; purchase plans</h3>
+              <p>Meet monthly needs at the lowest cost across shops, prices, and discounts.</p>
+            </div>
+            <div>
               <span className="use-ico"><GameIcon /></span>
               <h3>Game theory</h3>
               <p>Find optimal mixed strategies and guaranteed payoffs for competitive decisions.</p>
             </div>
           </div>
           <p className="note">
-            All three model types understand your own wording instantly in your browser — no signup, no server, no API key.
-            Describe profits with limited resources, shipping supplies/demands/costs, or a game payoff. General math (equations, calculus) is out of scope.
+            All four model types understand your own wording instantly in your browser — no signup, no server, no API key.
+            Describe profits with limited resources, shipping supplies/demands/costs, shopping needs with shop prices, or a game payoff. General math (equations, calculus) is out of scope.
             Connect the optional FastAPI backend with GPT-6 Astra for extra AI understanding of very long descriptions.
           </p>
         </section>

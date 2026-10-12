@@ -59,9 +59,35 @@ class GameModel(BaseModel):
     zero_sum: bool = True
 
 
+class DiscountRule(BaseModel):
+    shop: str = Field(min_length=1, max_length=80)
+    amount: float = Field(ge=0)
+    threshold: float = Field(ge=0)
+
+
+class ProcurementModel(BaseModel):
+    shops: list[str] = Field(min_length=1, max_length=30)
+    items: list[str] = Field(min_length=1, max_length=50)
+    requirements: dict[str, float]
+    prices: dict[str, dict[str, float]]
+    discounts: list[DiscountRule] = Field(default_factory=list)
+
+    @field_validator("requirements", "prices")
+    @classmethod
+    def values_must_be_non_negative(cls, value: dict) -> dict:
+        def check(node: object) -> None:
+            if isinstance(node, dict):
+                for child in node.values():
+                    check(child)
+            elif isinstance(node, (int, float)) and node < 0:
+                raise ValueError("procurement quantities and prices must be non-negative")
+        check(value)
+        return value
+
+
 class BusinessModel(BaseModel):
-    model_type: Literal["production", "transportation", "game_theory"]
-    model: PlanningModel | TransportationModel | GameModel
+    model_type: Literal["production", "transportation", "procurement", "game_theory"]
+    model: PlanningModel | TransportationModel | ProcurementModel | GameModel
     problem_summary: str = ""
     technique: str = ""
     objective: str = ""
@@ -94,6 +120,13 @@ class ShipmentResult(BaseModel):
     cost: float
 
 
+class PurchaseResult(BaseModel):
+    shop: str
+    item: str
+    quantity: float
+    cost: float
+
+
 class StrategyResult(BaseModel):
     player: str
     action: str
@@ -101,8 +134,8 @@ class StrategyResult(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    model_type: Literal["production", "transportation", "game_theory"]
-    model: PlanningModel | TransportationModel | GameModel
+    model_type: Literal["production", "transportation", "procurement", "game_theory"]
+    model: PlanningModel | TransportationModel | ProcurementModel | GameModel
     problem_summary: str = ""
     technique: str = ""
     objective: str = ""
@@ -112,8 +145,11 @@ class AnalyzeResponse(BaseModel):
     products: list[ProductResult] = Field(default_factory=list)
     resources: list[ResourceResult] = Field(default_factory=list)
     shipments: list["ShipmentResult"] = Field(default_factory=list)
+    purchases: list[PurchaseResult] = Field(default_factory=list)
     strategies: list[StrategyResult] = Field(default_factory=list)
     game_value: float | None = None
     total_profit: float | None = None
     total_cost: float | None = None
+    discount_applied: float = 0
+    currency: str = "$"
     explanation: str

@@ -18,6 +18,13 @@ def _solve_transportation(model: Any) -> dict[str, Any]:
     return {"shipments": shipments, "total_cost": total_cost}
 
 
+def _solve_procurement(model: Any) -> dict[str, Any]:
+    from .optimizer import solve_procurement
+
+    purchases, total_cost, discount_applied = solve_procurement(model)
+    return {"purchases": purchases, "total_cost": total_cost, "discount_applied": discount_applied}
+
+
 def _solve_game(model: Any) -> dict[str, Any]:
     from .optimizer import solve_game
 
@@ -28,6 +35,7 @@ def _solve_game(model: Any) -> dict[str, Any]:
 SOLVERS: dict[str, Solver] = {
     "production": _solve_production,
     "transportation": _solve_transportation,
+    "procurement": _solve_procurement,
     "game_theory": _solve_game,
 }
 

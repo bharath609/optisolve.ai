@@ -7,6 +7,20 @@ from urllib.request import Request, urlopen
 from .schemas import BusinessModel
 
 
+def detect_currency(text: str) -> str:
+    if "₹" in text:
+        return "₹"
+    if re.search(r"\bRs\.?", text, re.I):
+        return "₹"
+    if "€" in text:
+        return "€"
+    if "£" in text:
+        return "£"
+    if "$" in text:
+        return "$"
+    return "$"
+
+
 async def extract_model(problem: str) -> BusinessModel:
     if not _is_complex_problem(problem):
         simple_key = os.getenv("SIMPLE_AI_API_KEY")
@@ -49,7 +63,9 @@ Product names can be anything (chairs, bread, phones, X1...). Resource names can
 Costs can appear as "A to X costs 4", "A->X 4", "$4 from A to X", "cost from A to X is 4".
 Normalize them, keep numbers exact, never invent numbers.
 First trace the problem: production (make things for profit with limited resources),
-transportation (ship from supplies to demands with route costs), or game theory (two players, payoffs).
+transportation (ship from supplies to demands with route costs),
+procurement (buy minimum quantities cheapest across shops with unit prices and possible threshold discounts),
+or game theory (two players, payoffs).
 If the text is general math (equations, calculus) rather than production/transportation/game-theory
 optimization, return {"error":"unsupported"}."""
 
@@ -64,11 +80,12 @@ async def _extract_with_provider(
     model = model or os.getenv("EXPERIENTIAL_MODEL", "gpt-6-astra")
     prompt = """You are an operations-research model classifier and mathematical formulation assistant. Read the business problem and return JSON only.
 
-Choose model_type as production, transportation, or game_theory. Return this envelope:
-{"model_type":"production|transportation|game_theory","problem_summary":string,"technique":string,"objective":string,"variables":[string],"constraints":[string],"assumptions":[string],"model":{...}}
+Choose model_type as production, transportation, procurement, or game_theory. Return this envelope:
+{"model_type":"production|transportation|procurement|game_theory","problem_summary":string,"technique":string,"objective":string,"variables":[string],"constraints":[string],"assumptions":[string],"model":{...}}
 
 For production, model must be {"products":[{"name":string,"profit":number,"resource_usage":{resource:number},"demand_limit":number|null}],"capacities":{resource:number}}.
 For transportation, model must be {"sources":[{"name":string,"supply":number}],"destinations":[{"name":string,"demand":number}],"costs":{"source":{"destination":number}}}.
+For procurement (groceries, diet, vendor choice: meet minimum needs cheapest across shops), model must be {"shops":[string],"items":[string],"requirements":{item:number},"prices":{"shop":{item:number}},"discounts":[{"shop":string,"amount":number,"threshold":number}]}. List items in requirement order and map "respectively" prices to that order.
 For game_theory, model must be {"player_one_actions":[string],"player_two_actions":[string],"payoffs":{"player_one_action":{"player_two_action":number}},"zero_sum":true}. Use Player 1's payoff values and preserve negative payoffs.
 Use consistent names, preserve all stated numbers, and do not invent missing numbers. If the problem is neither supported type, return a concise JSON error with {"error":"unsupported"}.
 
@@ -88,7 +105,7 @@ Use consistent names, preserve all stated numbers, and do not invent missing num
     content = await asyncio.to_thread(call_provider)
     payload = json.loads(_strip_code_fence(content))
     if payload.get("error") == "unsupported":
-        raise ValueError("OptiSolve only solves optimization problems — production planning, transportation, and game theory — not general math. Describe profits with limited resources, shipping supplies/demands/costs, or a game payoff, in any wording.")
+        raise ValueError("OptiSolve only solves optimization problems — production planning, transportation, shopping/purchase planning, and game theory — not general math. Describe profits with limited resources, shipping supplies/demands/costs, shopping needs with shop prices, or a game payoff, in any wording.")
     return BusinessModel.model_validate(payload)
 
 
@@ -483,6 +500,27 @@ def _extract_with_fallback(problem: str) -> BusinessModel:
             + [f"deliveries to {d} must meet demand {q}" for d, q in destinations],
             "assumptions": ["Understood your wording automatically; shipping cost is linear in quantity."],
         })
+    # Minimum-cost purchase / grocery / diet attempt — solved directly, never relabelled.
+    procurement = _parse_procurement_free(text)
+    if procurement is not None:
+        shops, items, requirements, prices, discounts = procurement
+        return BusinessModel.model_validate({
+            "model_type": "procurement",
+            "model": {
+                "shops": shops,
+                "items": items,
+                "requirements": requirements,
+                "prices": prices,
+                "discounts": [{"shop": s, "amount": a, "threshold": t} for s, a, t in discounts],
+            },
+            "problem_summary": "Choose where to buy each item to meet all requirements at the lowest total cost.",
+            "technique": "Linear programming (minimum-cost purchase plan)",
+            "objective": "Minimize total purchase cost",
+            "variables": [f"quantity of {item} from {shop}" for shop in shops for item in items],
+            "constraints": [f"buy at least {requirements[item]:g} {item}" for item in items]
+            + [f"{shop} gives {amount:g} off when spending reaches {threshold:g} there" for shop, amount, threshold in discounts],
+            "assumptions": ["Understood your wording automatically; unit prices are fixed and quantities may be fractional."],
+        })
     # Legacy strict production path first (keeps old prompts working).
     products = []
     for sentence in text.split("."):
@@ -532,7 +570,7 @@ def _extract_with_fallback(problem: str) -> BusinessModel:
             "assumptions": ["Understood your wording automatically; quantities may be fractional unless whole units are required."],
         })
     if re.search(r"solve\s+(for\s+)?x\b|derivative|integral|quadratic|differentiate|integrate|simplify", text, re.I):
-        raise ValueError("OptiSolve only solves optimization problems — production planning, transportation, and game theory — not general math. Describe profits with limited resources, shipping supplies/demands/costs, or a game payoff, in any wording.")
+        raise ValueError("OptiSolve only solves optimization problems — production planning, transportation, shopping/purchase planning, and game theory — not general math. Describe profits with limited resources, shipping supplies/demands/costs, shopping needs with shop prices, or a game payoff, in any wording.")
     if re.search(r"warehouse|ship|shipping|transport|freight|supplier|customer|distribution|supply|demand", text, re.I):
         partial = _diagnose_transportation(text)
         if partial["sources"] and partial["destinations"] and partial["missing_routes"]:
@@ -565,6 +603,27 @@ def _extract_with_fallback(problem: str) -> BusinessModel:
             "'Warehouse A has 100 units, Store X needs 120 units, shipping from A to X costs 4 per unit.' "
             "Any wording with the same numbers works."
         )
+    if re.search(r"shop|store|vendor|sells?|purchase|buys?|prices?|discount|grocery|mart", text, re.I) and not re.search(r"profit|margin|contribution", text, re.I):
+        shops: list[str] = []
+        seen: set[str] = set()
+        for m in re.finditer(SHOP_WORD + r"\s+([A-Za-z0-9]+)", text, re.I):
+            name = _clean_name(m.group(0))
+            key = _canon(name)
+            if name and key not in seen:
+                seen.add(key)
+                shops.append(name)
+        needs = [f"{m.group(2).strip()} ({m.group(1)})" for m in re.finditer(r"(?:at\s+least\s+|needs?\s+(?:at\s+least\s+)?)(\d+(?:\.\d+)?)\s*(?:kg|liters?|units?)?\s*(?:of\s+)?([A-Za-z][A-Za-z][\w\- ]*?)(?=\s*(?:and|,|;|\.|per\s+(?:month|day)|$))", text, re.I) if "₹" not in m.group(0) and "$" not in m.group(0)]
+        if shops or needs:
+            bits = []
+            if shops:
+                bits.append("shops " + ", ".join(shops))
+            if needs:
+                bits.append("needs " + ", ".join(needs[:5]))
+            raise ValueError(
+                f"Got it — this is a shopping / purchase problem ({'; '.join(bits)}). "
+                "To find your cheapest plan, add how much you need and the price at each shop — e.g. "
+                "'We need at least 10 kg of rice. Shop A sells rice at ₹50/kg, Shop B at ₹45/kg.' Any wording works."
+            )
     if re.search(r"profit|margin|earn|contribution|gain|revenue|produces?|manufactures?|capacity|available|machine|labo?r|wood|oven", text, re.I):
         partial = _diagnose_production(text)
         if partial["products"] or partial["capacities"]:
@@ -580,7 +639,7 @@ def _extract_with_fallback(problem: str) -> BusinessModel:
                 f"To find your optimal plan, add what each item needs and what limits you — e.g. "
                 f"\"Each {singular} needs 2 wood and 1 labor. We have 100 wood and 80 labor.\" Any wording works."
             )
-    raise ValueError("Tell me about your problem in your own words and I'll work out the rest — e.g.: 'We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor.' Or shipping: 'Warehouse A has 100, Store X needs 120, A to X costs 4.' I handle production, transportation, and game-theory problems (not general math).")
+    raise ValueError("Tell me about your problem in your own words and I'll work out the rest — e.g.: 'We make chairs (40 profit, 2 wood + 1 labor) and tables (30 profit, 1 wood + 2 labor). We have 100 wood and 80 labor.' Or shipping: 'Warehouse A has 100, Store X needs 120, A to X costs 4.' Or shopping: 'We need 10 kg rice. Shop A sells rice at ₹50/kg, Shop B at ₹45/kg.' I handle production, transportation, shopping/purchase, and game-theory problems (not general math).")
 
 
 def _diagnose_transportation(text: str) -> dict:
@@ -653,6 +712,150 @@ def _diagnose_production(text: str) -> dict:
     except Exception:
         capacities = {}
     return {"products": products[:5], "capacities": dict(list(capacities.items())[:6])}
+
+
+SHOP_WORD = r"(?:shop|store|vendor|supplier|mart|market|mall|outlet|dealer)"
+QTY_UNIT = r"(?:kg|kgs|kilos?|grams?|gms?|g|liters?|litres?|ltrs?|l|ml|units?|packs?|packets?|bottles?|cans?|pieces?|dozens?|bags?)"
+MONEY = r"(?:₹|Rs\.?|\$|€|£)"
+
+
+def _clean_item_name(raw: str) -> str:
+    s = _clean_name(raw)
+    s = re.sub(r"\s+(per\s+(?:month|day|week|year)|each\s+(?:month|day)|monthly|daily)$", "", s, flags=re.I).strip()
+    s = re.sub(r"\s+from\s+(?:shop|store|vendor|supplier|mart|market|mall|outlet|dealer)\s+[A-Za-z0-9]+$", "", s, flags=re.I).strip()
+    s = re.sub(r"^(at\s+least|atleast|minimum\s+of|minimum|min)\s+", "", s, flags=re.I).strip()
+    return s
+
+
+def _parse_procurement_free(text: str):
+    """Minimum-cost purchase plans in any wording. Returns
+    (shops, items, requirements, prices, discounts) or None."""
+    if not re.search(SHOP_WORD + r"|sells?|purchase|buys?|prices?|discount|grocery", text, re.I):
+        return None
+    if re.search(r"profit|margin|contribution", text, re.I):
+        return None
+    shops: list[str] = []
+    seen_shops: set[str] = set()
+    for m in re.finditer(SHOP_WORD + r"\s+([A-Za-z0-9]+)", text, re.I):
+        name = _clean_name(m.group(0))
+        key = _canon(name)
+        if not name or key in seen_shops:
+            continue
+        seen_shops.add(key)
+        shops.append(name)
+    if not shops:
+        return None
+
+    def shop_mentions(sentence: str) -> list[tuple[int, str]]:
+        out: list[tuple[int, str]] = []
+        for m in re.finditer(SHOP_WORD + r"\s+([A-Za-z0-9]+)", sentence, re.I):
+            cand = _clean_name(m.group(0))
+            hit = next((s for s in shops if _canon_hit(s, cand)), None)
+            if hit:
+                out.append((m.start(), hit))
+        return out
+
+    def shop_in_sentence(sentence: str) -> str | None:
+        found = shop_mentions(sentence)
+        return found[0][1] if found else None
+
+    items: list[str] = []
+    requirements: dict[str, float] = {}
+    seen_items: set[str] = set()
+
+    def add_req(raw_item: str, qty: float):
+        item = _clean_item_name(raw_item)
+        if not item or len(item) > 40:
+            return
+        if re.search(r"demand|supply|profit|discount|purchase\s+value|^total$", item, re.I):
+            return
+        key = _canon(item)
+        if not key or key in seen_items:
+            return
+        seen_items.add(key)
+        items.append(item)
+        requirements[item] = qty
+
+    req_look = r"(?=\s*(?:and|,|;|\.|per\s+(?:month|day|week)|each\s+(?:month|day)|$))"
+    sentences = re.split(r"[.\n;]+", text)
+    for raw in sentences:
+        s = raw.strip()
+        if not s:
+            continue
+        for m in re.finditer(
+            r"(?:needs?|requires?|must\s+(?:buy|get|have)|should\s+(?:buy|get))\s+(?:at\s+least\s+|atleast\s+|a\s+minimum\s+of\s+|minimum\s+of\s+|minimum\s+|min\s+)?(\d+(?:\.\d+)?)\s*" + QTY_UNIT + r"?\s*(?:of\s+)?([A-Za-z][A-Za-z][\w\- ]*?)" + req_look,
+            s, re.I,
+        ):
+            if re.search(MONEY, m.group(0)):
+                continue
+            add_req(m.group(2), float(m.group(1)))
+        for m in re.finditer(r"at\s+least\s+(\d+(?:\.\d+)?)\s*" + QTY_UNIT + r"?\s*(?:of\s+)?([A-Za-z][A-Za-z][\w\- ]*?)" + req_look, s, re.I):
+            if re.search(MONEY, m.group(0)):
+                continue
+            add_req(m.group(2), float(m.group(1)))
+        if re.search(r"needs?|requires?|at\s+least|minimum", s, re.I) and requirements:
+            for m in re.finditer(r"(\d+(?:\.\d+)?)\s*" + QTY_UNIT + r"\s*(?:of\s+)?([A-Za-z][A-Za-z][\w\- ]*?)" + req_look, s, re.I):
+                if re.search(MONEY, m.group(0)):
+                    continue
+                add_req(m.group(2), float(m.group(1)))
+    if not items:
+        return None
+
+    prices: dict[str, dict[str, float]] = {}
+    last_shop: str | None = None
+    for raw in sentences:
+        s = raw.strip()
+        if not s:
+            continue
+        mentions = shop_mentions(s)
+        mentioned = mentions[0][1] if mentions else None
+        if mentioned:
+            last_shop = mentioned
+        if re.search(r"respectively", s, re.I) and mentioned:
+            nums = [float(v) for v in re.findall(r"(?:" + MONEY + r")?\s*(\d+(?:\.\d+)?)", s)]
+            if len(nums) == len(items):
+                prices.setdefault(mentioned, {}).update({item: value for item, value in zip(items, nums)})
+                last_shop = mentioned
+                continue
+        last_item: str | None = None
+        for m in re.finditer(r"([A-Za-z][A-Za-z][\w\- ]*?)\s+at\s+(" + MONEY + r")?\s*(\d+(?:\.\d+)?)\s*(\/\s*\w+)?", s, re.I):
+            if not m.group(2) and not m.group(4):
+                continue
+            cand = _clean_item_name(m.group(1))
+            # shop restated inside the price ("Shop B at ₹45")? it owns this price
+            inner = next((s for s in shops if _canon_hit(s, _clean_name(m.group(1)))), None)
+            shop = inner or next((sh for pos, sh in mentions if pos < m.start()), None) or mentioned or last_shop
+            if not shop:
+                continue
+            hit = next((it for it in items if _canon_hit(it, cand)), None)
+            if not hit:
+                # "Shop B at ₹45" — shop restated without the item: same item as before
+                if inner and last_item:
+                    hit = last_item
+                else:
+                    continue
+            last_item = hit
+            prices.setdefault(shop, {}).setdefault(hit, float(m.group(3)))
+        if mentions:
+            last_shop = mentions[-1][1]
+    priced_shops = [sh for sh in shops if prices.get(sh)]
+    if not priced_shops:
+        return None
+    for item in items:
+        if not any(item in prices.get(sh, {}) for sh in priced_shops):
+            return None
+
+    discounts: list[tuple[str, float, float]] = []
+    for m in re.finditer(
+        SHOP_WORD + r"\s+([A-Za-z0-9]+)\s*[^.\n;]*?(\d+(?:\.\d+)?)\s*discount[^.\n;]*?(?:at\s+least|over|above|minimum\s+(?:of\s+)?|more\s+than|exceeding|reaches|reaching)\s*(?:" + MONEY + r")?\s*(\d+(?:\.\d+)?)",
+        text, re.I,
+    ):
+        cand = _clean_name(m.group(0))
+        hit = next((s for s in priced_shops if _canon_hit(s, cand)), priced_shops[0])
+        amount, threshold = float(m.group(2)), float(m.group(3))
+        if amount > 0 and threshold > 0 and not any(d[0] == hit for d in discounts):
+            discounts.append((hit, amount, threshold))
+    return priced_shops, items, requirements, prices, discounts
 
 
 def _parse_transportation_free(text: str):
