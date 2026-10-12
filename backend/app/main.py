@@ -19,7 +19,7 @@ frontend_origins = [
         "FRONTEND_ORIGINS",
         os.getenv(
             "FRONTEND_ORIGIN",
-            "http://localhost:5173,https://optiforge-ai.vercel.app,https://optiforge.ai,https://www.optiforge.ai,https://optisolve.vercel.app,https://optisolve.ai,https://www.optisolve.ai",
+            "http://localhost:5173,https://optiforge-ai.vercel.app,https://optiforge.ai,https://www.optiforge.ai,https://optisolve.vercel.app,https://optisolve.ai,https://www.optisolve.ai,https://bharath609.github.io",
         ),
     ).split(",")
     if origin.strip()
