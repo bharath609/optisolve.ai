@@ -754,7 +754,7 @@ function App() {
             <a href="https://github.com/bharath609/optisolve" target="_blank" rel="noreferrer">
               GitHub
             </a>
-            <a href="https://optisolve.ai/" target="_blank" rel="noreferrer">
+            <a href="https://optisolve.vercel.app/" target="_blank" rel="noreferrer">
               Live site
             </a>
             <a href="#solver">Solver</a>

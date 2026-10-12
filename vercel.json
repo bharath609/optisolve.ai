@@ -6,7 +6,7 @@
     {
       "source": "/(.*)",
       "has": [{ "type": "host", "value": "optiforge-ai.vercel.app" }],
-      "destination": "https://optisolve.ai/$1",
+      "destination": "https://optisolve.vercel.app/$1",
       "permanent": true
     }
   ],
