@@ -157,11 +157,11 @@ h1 { margin: 0; font-family: var(--display); font-size: clamp(2.6rem, 5.6vw, 4.4
 }
 .hero-card-wrap:hover .hero-card { transform: perspective(1200px) rotateY(0deg) rotateX(0deg); }
 .hero-card-head { display: flex; align-items: center; gap: 7px; padding: 14px 18px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,0.02); }
-.hero-card-head span { width: 10px; height: 10px; border-radius: 50%; background: #2c4763; display: block; }
+.hero-card-head span:not(.live-dot) { width: 10px; height: 10px; border-radius: 50%; background: #2c4763; display: block; flex-shrink: 0; }
 .hero-card-head span:first-child { background: #ff8f85; }
 .hero-card-head span:nth-child(2) { background: #f5c86e; }
 .hero-card-head span:nth-child(3) { background: var(--mint); }
-.live-dot { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; font: 500 0.66rem var(--mono); color: var(--mint); letter-spacing: 0.08em; }
+.live-dot { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; font: 500 0.66rem var(--mono); color: var(--mint); letter-spacing: 0.08em; white-space: nowrap; flex-shrink: 0; width: auto; }
 .live-dot i { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 10px var(--mint); animation: pulse 1.6s ease infinite; }
 .hero-card-body { padding: 24px 22px 20px; }
 .hero-metric-label { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 0.74rem; font-weight: 600; letter-spacing: 0.08em; }
